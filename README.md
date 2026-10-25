@@ -79,8 +79,8 @@ The command waits until the emulator is ready, then prints JSON. Use the
 `endpoint.adb_serial` from that response for device commands:
 
 ```sh
-# Use the serial returned by acquire, not a hard-coded serial in a shared script.
-adb -s emulator-5574 shell getprop ro.build.version.sdk
+# Replace <adb_serial> with endpoint.adb_serial from the acquire response.
+adb -s "<adb_serial>" shell getprop ro.build.version.sdk
 ```
 
 `--owner` is your label for the job. `--capability` selects a matching slot.

@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Exercise installed entry points and a zipapp, away from the checkout."""
+import argparse
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
+from test_resource_lease_android import make_fake_android_sdk  # noqa: E402
+
+
+def check(command, directory):
+    fixture = make_fake_android_sdk(directory / "sdk")
+    port = None
+    for candidate in range(5600, 5682, 2):
+        with socket.socket() as first, socket.socket() as second:
+            try:
+                first.bind(("127.0.0.1", candidate))
+                second.bind(("127.0.0.1", candidate + 1))
+                port = candidate
+                break
+            except OSError:
+                continue
+    if port is None:
+        raise RuntimeError("no free fake-SDK port pair")
+    config = directory / "config.json"
+    config.write_text(json.dumps({
+        "schema": 1,
+        "slots": [{"id": "test", "backend": "android", "capabilities": ["test"],
+                   "options": fixture.options(port)}],
+    }))
+    pool = directory / "pool"
+    receipt = directory / "job.lease.json"
+    environment = {key: value for key, value in os.environ.items()
+                   if key != "PYTHONPATH" and not key.startswith("KENT")}
+    environment["RESOURCE_LEASE_HOME"] = str(directory / "guards")
+
+    def call(*arguments):
+        result = subprocess.run(
+            [*command, "--root", str(pool), *map(str, arguments)],
+            cwd=directory, env=environment, capture_output=True, text=True, timeout=45,
+        )
+        if result.returncode:
+            raise RuntimeError(f"{arguments[0]} failed: {result.stderr[-4096:]}")
+        return json.loads(result.stdout)
+
+    call("init", "--config", config)
+    try:
+        assert call("start")["service"]["available"]
+        assert call("acquire", "--owner", "test", "--capability", "test",
+                    "--lease", receipt, "--wait", "20")["state"] == "active"
+        assert call("renew", "--owner", "test", "--lease", receipt)["state"] == "active"
+        released = call("release", "--owner", "test", "--lease", receipt, "--wait", "20")
+        assert released["state"] == "completed" and not released["cleanup_pending"]
+    finally:
+        state = call("shutdown", "--wait", "20")
+        assert state["service"]["state"] == "stopped"
+        assert state["slots"][0]["state"] == "idle"
+        # Status is durable before the service releases its final OS lock.
+        time.sleep(0.3)
+    print(f"Passed: {' '.join(command)}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--python", type=Path, required=True,
+                        help="Python from a virtual environment containing the installed wheel")
+    parser.add_argument("--zipapp", type=Path, required=True)
+    args = parser.parse_args()
+    # Do not resolve the venv interpreter symlink: its location selects the venv.
+    python = args.python.absolute()
+    commands = [
+        [str(python.parent / "resource-lease")],
+        [str(python), "-I", "-m", "resourcelease"],
+        [str(python), "-I", str(args.zipapp.resolve())],
+    ]
+    with tempfile.TemporaryDirectory() as temporary:
+        for index, command in enumerate(commands):
+            directory = Path(temporary) / str(index)
+            directory.mkdir()
+            check(command, directory)
+
+
+if __name__ == "__main__":
+    main()

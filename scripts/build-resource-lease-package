@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Build an opt-in zipapp without installing it or contacting a package index."""
+import argparse
+from pathlib import Path
+import tempfile
+import shutil
+import zipapp
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--output", required=True, type=Path)
+args = parser.parse_args()
+output = args.output.expanduser().absolute()
+if output.exists():
+    parser.error("output already exists; choose a new artifact path")
+source = Path(__file__).resolve().parents[1]
+with tempfile.TemporaryDirectory(prefix="resource-lease-package-") as temporary:
+    root = Path(temporary)
+    shutil.copytree(source / "resourcelease", root / "resourcelease",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    (root / "__main__.py").write_text(
+        "from resourcelease.__main__ import entrypoint\nraise SystemExit(entrypoint())\n",
+        encoding="utf-8",
+    )
+    # Exclusive creation also protects against a competing build or a symlink.
+    with output.open("xb") as stream:
+        zipapp.create_archive(root, stream, interpreter="/usr/bin/env python3", compressed=True)
+        import os
+        os.fchmod(stream.fileno(), 0o700)
+print(output)

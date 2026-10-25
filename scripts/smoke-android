@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Run an opt-in three-generation lifecycle using the public CLI and exact-serial ADB."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import uuid
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--package", type=Path, required=True)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--root", type=Path, required=True,
+                        help="new dedicated pool; must not exist")
+    args = parser.parse_args()
+    root = args.root.expanduser().absolute()
+    if root.exists() or root.is_symlink():
+        parser.error("root must not exist; inspect any previous run before retrying")
+    config = json.loads(args.config.read_text())
+    if len(config.get("slots", [])) != 1 or config.get("lease_seconds") != 30:
+        parser.error("smoke config must have one slot and lease_seconds=30")
+    slot = config["slots"][0]
+    if slot.get("backend") != "android":
+        parser.error("smoke requires an Android slot")
+    adb = Path(slot["options"]["sdk_root"]) / "platform-tools" / "adb"
+    command = [sys.executable, "-I", str(args.package.resolve()), "--root", str(root)]
+    environment = {key: value for key, value in os.environ.items()
+                   if key != "PYTHONPATH" and not key.startswith("KENT")}
+    waiting = None
+    initialized = False
+
+    def call(*arguments, timeout=270):
+        completed = subprocess.run(
+            [*command, *map(str, arguments)], capture_output=True, text=True,
+            env=environment, timeout=timeout,
+        )
+        if completed.returncode:
+            raise RuntimeError(f"{arguments[0]}: {completed.stderr[-4096:]}")
+        return json.loads(completed.stdout)
+
+    def device(serial, *arguments):
+        completed = subprocess.run(
+            [str(adb), "-s", serial, *arguments],
+            env=environment, capture_output=True, text=True, timeout=15,
+        )
+        if completed.returncode:
+            raise RuntimeError(f"ADB observation failed: {completed.stderr[-4096:]}")
+        return completed.stdout.strip()
+
+    try:
+        call("init", "--config", args.config.resolve())
+        initialized = True
+        assert call("start")["service"]["available"]
+        receipts = [root / f"smoke-{name}.lease.json" for name in ("a", "b", "c")]
+
+        def acquisition(owner, receipt):
+            return ["acquire", "--owner", owner, "--capability", slot["capabilities"][0],
+                    "--lease", str(receipt), "--wait", "240"]
+
+        first = call(*acquisition("smoke-a", receipts[0]))
+        serial = first["endpoint"]["adb_serial"]
+        api = device(serial, "shell", "getprop", "ro.build.version.sdk")
+        marker = f"/data/local/tmp/resource-lease-smoke-{uuid.uuid4().hex}"
+        device(serial, "shell", "touch", marker)
+        call("renew", "--owner", "smoke-a", "--lease", receipts[0])
+        waiting = subprocess.Popen(
+            [*command, *acquisition("smoke-b", receipts[1])], env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        deadline = time.monotonic() + 10
+        while True:
+            state = call("status")
+            queued = [r for r in state["requests"] if r["owner"] == "smoke-b"]
+            if queued:
+                assert queued[0]["state"] == "queued"
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError("second caller did not enter the queue")
+            time.sleep(0.2)
+        released = call("release", "--owner", "smoke-a", "--lease", receipts[0])
+        assert released["state"] == "completed" and not released["cleanup_pending"]
+        out, err = waiting.communicate(timeout=240)
+        if waiting.returncode:
+            raise RuntimeError(f"second acquisition failed: {err[-4096:]}")
+        second = json.loads(out)
+        assert second["generation"] == first["generation"] + 1
+        device(second["endpoint"]["adb_serial"], "shell", "test", "!", "-e", marker)
+        third = call(*acquisition("smoke-c", receipts[2]))
+        assert third["generation"] == second["generation"] + 1
+        expired = call("inspect", "--owner", "smoke-b", "--lease", receipts[1])
+        assert expired["state"] == "expired" and not expired["cleanup_pending"]
+        assert device(third["endpoint"]["adb_serial"],
+                      "shell", "getprop", "ro.build.version.sdk") == api
+        call("release", "--owner", "smoke-c", "--lease", receipts[2])
+        result = call("shutdown")
+        assert result["service"]["state"] == "stopped"
+        assert all(s["state"] == "idle" for s in result["slots"])
+        print(json.dumps({"passed": True, "android_api": api, "generations": 3,
+                          "service": "stopped", "slot": "idle"}))
+    finally:
+        if waiting is not None and waiting.poll() is None:
+            waiting.terminate()
+            waiting.communicate(timeout=15)
+        if initialized:
+            call("shutdown")
+
+
+if __name__ == "__main__":
+    main()

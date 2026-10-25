@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77,<85"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "resource-lease"
+version = "0.1.0"
+description = "Local resource leases with a queue and an Android emulator backend"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Osome"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.scripts]
+resource-lease = "resourcelease.__main__:entrypoint"
+
+[project.urls]
+Repository = "https://github.com/rovkinmax/resource-lease"
+Issues = "https://github.com/rovkinmax/resource-lease/issues"
+
+[tool.setuptools.packages.find]
+include = ["resourcelease*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-include = ["scripts/*"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

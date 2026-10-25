@@ -200,7 +200,7 @@ def _parse_options(slot: Slot) -> _Options:
 
 
 def _port_bindable(port: int) -> bool:
-    """Return whether no local TCP listener reserves this port on either stack."""
+    """Return whether this port can be rebound on both local IP stacks."""
     # Check loopback as well as wildcard: SO_REUSEADDR can permit a wildcard
     # probe alongside a listener bound only to loopback on BSD-derived hosts.
     checks = [

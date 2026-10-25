@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import json
 import os
 from pathlib import Path
@@ -600,11 +601,13 @@ class AndroidBackendTests(unittest.TestCase):
         self.assertTrue(listener.fileno() >= 0)
         self.assertEqual(list(generation.iterdir()), [])
 
-    def test_time_wait_does_not_make_a_free_port_look_occupied(self):
+    def test_time_wait_with_reuse_enabled_can_be_rebound(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         accepted = None
         try:
+            # Linux requires reuse on both the old and the new socket.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(("127.0.0.1", self.port))
             listener.listen(1)
             client.connect(("127.0.0.1", self.port))
@@ -622,6 +625,28 @@ class AndroidBackendTests(unittest.TestCase):
             android_adapter._port_bindable(self.port),
             "TIME_WAIT was mistaken for a live listener",
         )
+
+    def test_time_wait_without_reuse_respects_kernel_bindability(self):
+        with socket.socket() as listener, socket.socket() as client:
+            listener.bind(("127.0.0.1", self.port))
+            listener.listen(1)
+            client.connect(("127.0.0.1", self.port))
+            accepted, _ = listener.accept()
+            accepted.close()
+            self.assertEqual(client.recv(1), b"")
+        # BSD may allow reuse here; Linux keeps this non-reusable socket reserved.
+        # The backend must never call a kernel-reserved port available.
+        with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("127.0.0.1", self.port))
+                probe.listen(1)
+            except OSError as error:
+                self.assertEqual(error.errno, errno.EADDRINUSE)
+                bindable = False
+            else:
+                bindable = True
+        self.assertEqual(android_adapter._port_bindable(self.port), bindable)
 
     def test_foreign_port_after_owned_child_exit_quarantines_until_free(self):
         self.sdk.configure(shutdown_delay=0.8)

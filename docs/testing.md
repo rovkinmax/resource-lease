@@ -23,7 +23,7 @@ From a clean build directory:
 
 ```sh
 python -m build
-python -m twine check --strict dist/*
+python -m twine check --strict dist/*.whl dist/*.tar.gz
 python scripts/build-resource-lease-package --output dist/resource-lease.pyz
 
 python -m venv .venv-installed

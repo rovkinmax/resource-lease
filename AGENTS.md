@@ -67,7 +67,7 @@ Use a local virtual environment and `requirements-dev.txt`. Before handing off:
 python -m ruff check .
 python -m unittest discover -s tests -p 'test_*.py'
 python -m build
-python -m twine check --strict dist/*
+python -m twine check --strict dist/*.whl dist/*.tar.gz
 ```
 
 For packaging, entry-point, or launch changes, also run the installed-wheel and

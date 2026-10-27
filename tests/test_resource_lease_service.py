@@ -258,6 +258,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_persistent_android_state_survives_expiry(self):
         sdk = make_fake_android_sdk(self.root / "expiry-android-sdk")
+        sdk.configure(shutdown_delay=1.5)
         try:
             port = free_console_port()
         except RuntimeError as error:
@@ -271,14 +272,20 @@ class ServiceTests(unittest.TestCase):
         avd_path = Path(sdk.calls("avdmanager")[0]["args"][-1])
         user_data = avd_path / "userdata-qemu.img"
         user_data.write_bytes(b"retained after expiry")
-        second_receipt = self.android_request(pool, "waiting-owner")
 
-        def second_active():
-            lease = pool.lease(second_receipt, "waiting-owner")
-            return lease if lease["state"] == "active" else None
+        def first_expired_and_cleaned():
+            lease = pool.lease(first_receipt, "expiring-owner")
+            slot = pool.status()["slots"][0]
+            return (
+                lease["state"] == "expired"
+                and not lease["cleanup_pending"]
+                and slot["state"] == "idle"
+            )
 
-        second = until(second_active, timeout=10)
+        until(first_expired_and_cleaned, timeout=10)
         self.assertEqual(pool.lease(first_receipt, "expiring-owner")["state"], "expired")
+        second_receipt = self.android_request(pool, "waiting-owner")
+        second = self.active(pool, second_receipt, "waiting-owner")
         self.assertEqual(second["generation"], 2)
         self.assertEqual(len(sdk.calls("avdmanager")), 1)
         self.assertEqual(len(sdk.calls("emulator")), 2)

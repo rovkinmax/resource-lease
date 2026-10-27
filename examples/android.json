@@ -12,6 +12,7 @@
         "sdk_root": "/absolute/path/to/Android/sdk",
         "java_home": "/absolute/path/to/jdk",
         "system_image": "system-images;android-34;google_apis;arm64-v8a",
+        "state_mode": "clean",
         "console_port": 5574,
         "memory_mb": 2048,
         "boot_timeout": 180

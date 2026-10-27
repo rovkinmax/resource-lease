@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import errno
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -16,6 +17,11 @@ from typing import Mapping
 import uuid
 
 from resourcelease.model import LeaseError, QuarantineError, Resource, Slot
+from resourcelease.backends.android_state import (
+    PersistentAndroidState,
+    canonical_state_directory,
+    state_identity,
+)
 from resourcelease.process import (
     CommandCancelled,
     CommandTimeout,
@@ -41,6 +47,7 @@ SYSTEM_IMAGE = re.compile(
 )
 ANDROID_OPTIONS = frozenset({
     "sdk_root", "java_home", "system_image", "console_port", "memory_mb", "boot_timeout",
+    "state_mode", "state_directory",
 })
 ANDROID_REQUIRED = frozenset({"sdk_root", "java_home", "system_image", "console_port"})
 RADIO_FEATURES = ("BluetoothEmulation", "Uwb", "Nfc", "WiFiPacketStream")
@@ -54,6 +61,9 @@ class _Options:
     console_port: int
     memory_mb: int
     boot_timeout: float
+    state_mode: str
+    state_directory: Path | None
+    image_identity: Mapping[str, object]
     avdmanager: Path
     emulator: Path
     adb: Path
@@ -64,7 +74,7 @@ class _Options:
 
     def environment(self, private_home: Path, avd_home: Path) -> dict[str, str]:
         # Keep the caller's real HOME: SDK launcher scripts and the host runtime
-        # may need it. Redirect only Android SDK state into this lease generation.
+        # may need it. Redirect Android SDK state into the selected private home.
         environment = os.environ.copy()
         environment.update({
             "ANDROID_HOME": str(self.sdk_root),
@@ -139,6 +149,38 @@ def _find_avdmanager(sdk_root: Path) -> Path:
     raise LeaseError(f"Android SDK has no installed command-line tools avdmanager: {tools}")
 
 
+def _system_image_identity(image_path: Path, package_id: str) -> dict[str, object]:
+    try:
+        resolved = image_path.resolve(strict=True)
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise LeaseError(f"Android system image is not a regular file: {image_path}")
+        properties_path = resolved.parent / "source.properties"
+        try:
+            properties_info = properties_path.lstat()
+        except FileNotFoundError:
+            properties_digest = None
+        else:
+            if (not stat.S_ISREG(properties_info.st_mode)
+                    or properties_info.st_size > 64 * 1024):
+                raise LeaseError("Android system image source.properties is unsafe or oversized")
+            properties = properties_path.read_bytes()
+            if len(properties) != properties_info.st_size or len(properties) > 64 * 1024:
+                raise LeaseError("Android system image source.properties changed during inspection")
+            properties_digest = hashlib.sha256(properties).hexdigest()
+    except LeaseError:
+        raise
+    except (OSError, RuntimeError) as error:
+        raise LeaseError(f"cannot identify installed Android system image: {package_id}") from error
+    return {
+        "package": package_id,
+        "path": str(resolved),
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "source_properties_sha256": properties_digest,
+    }
+
+
 def _parse_options(slot: Slot) -> _Options:
     options = slot.options
     if not isinstance(options, Mapping):
@@ -149,6 +191,20 @@ def _parse_options(slot: Slot) -> _Options:
         raise LeaseError(f"Android backend options are missing: {', '.join(sorted(missing))}")
     if unexpected:
         raise LeaseError(f"unsupported Android backend options: {', '.join(sorted(unexpected))}")
+
+    state_mode = options.get("state_mode", "clean")
+    if not isinstance(state_mode, str) or state_mode not in {"clean", "persistent"}:
+        raise LeaseError("Android state_mode must be 'clean' or 'persistent'")
+    if state_mode == "persistent":
+        if "state_directory" not in options:
+            raise LeaseError("Android state_directory is required for persistent state_mode")
+        state_directory = canonical_state_directory(options["state_directory"])
+    else:
+        if "state_directory" in options:
+            raise LeaseError(
+                "Android state_directory is only valid with state_mode='persistent'"
+            )
+        state_directory = None
 
     sdk_root = _path_option(options, "sdk_root")
     java_home = _path_option(options, "java_home")
@@ -164,11 +220,7 @@ def _parse_options(slot: Slot) -> _Options:
         raise LeaseError("Android system_image must be an installed SDK package ID")
     _, api, flavor, abi = system_image.split(";")
     image_path = sdk_root / "system-images" / api / flavor / abi / "system.img"
-    try:
-        if not image_path.is_file():
-            raise LeaseError(f"Android system image is not installed: {system_image}")
-    except OSError as error:
-        raise LeaseError(f"cannot inspect Android system image: {system_image}") from error
+    image_identity = _system_image_identity(image_path, system_image)
 
     port = options.get("console_port")
     if (isinstance(port, bool) or not isinstance(port, int)
@@ -194,7 +246,8 @@ def _parse_options(slot: Slot) -> _Options:
     emulator = _executable(sdk_root / "emulator" / "emulator", "emulator")
     adb = _executable(sdk_root / "platform-tools" / "adb", "adb")
     return _Options(
-        sdk_root, java_home, system_image, port, memory, timeout,
+        sdk_root, java_home, system_image, port, memory, timeout, state_mode,
+        state_directory, image_identity,
         avdmanager, emulator, adb,
     )
 
@@ -352,19 +405,59 @@ def _command_error(label: str, result, timeout: float | None = None) -> LeaseErr
 
 
 class AndroidBackend:
-    """Create a disposable SDK-owned AVD and supervise its direct emulator child."""
+    """Supervise an SDK-owned disposable or explicitly persistent AVD."""
 
     def keys(self, slot: Slot) -> tuple[str, ...]:
         options = _parse_options(slot)
-        return (f"tcp-port:{options.console_port}", f"tcp-port:{options.adb_port}")
+        keys = [f"tcp-port:{options.console_port}", f"tcp-port:{options.adb_port}"]
+        if options.state_mode == "persistent":
+            assert options.state_directory is not None
+            keys.append(f"android-state:{state_identity(options.state_directory)}")
+        return tuple(keys)
 
     def start(self, slot: Slot, directory: Path, cancelled: Event) -> "AndroidResource":
         options = _parse_options(slot)
         generation = _require_generation(directory)
         _assert_ports_free(options)
-        private_home, avd_home, marker = _create_private_home(generation)
-        avd_name = f"resource_lease_{uuid.uuid4().hex[:16]}"
-        avd_path = avd_home / f"{avd_name}.avd"
+        persistent_state = None
+        if options.state_mode == "persistent":
+            if cancelled.is_set():
+                raise LeaseError("Android resource start cancelled before state preparation")
+            assert options.state_directory is not None
+            generations = generation.parent
+            if generations.name == "generations":
+                try:
+                    options.state_directory.relative_to(generations.resolve(strict=True))
+                except ValueError:
+                    pass
+                else:
+                    raise LeaseError(
+                        "persistent Android state_directory must be outside generations"
+                    )
+            persistent_state = PersistentAndroidState.prepare(
+                options.state_directory,
+                system_image=options.system_image,
+                image_identity=options.image_identity,
+                memory_mb=options.memory_mb,
+            )
+            private_home = persistent_state.private_home
+            avd_home = persistent_state.avd_home
+            marker = None
+            avd_name = persistent_state.avd_name
+            avd_path = persistent_state.avd_path
+            create_avd = not persistent_state.complete
+            if create_avd:
+                locator = avd_home / f"{avd_name}.ini"
+                if (avd_path.exists() or avd_path.is_symlink()
+                        or locator.exists() or locator.is_symlink()):
+                    raise LeaseError(
+                        "incomplete persistent Android AVD found; preserving state"
+                    )
+        else:
+            private_home, avd_home, marker = _create_private_home(generation)
+            avd_name = f"resource_lease_{uuid.uuid4().hex[:16]}"
+            avd_path = avd_home / f"{avd_name}.avd"
+            create_avd = True
         environment = options.environment(private_home, avd_home)
         avdmanager_log = generation / "android-avdmanager.log"
         emulator_log = generation / "android-emulator.log"
@@ -374,24 +467,27 @@ class AndroidBackend:
         try:
             if cancelled.is_set():
                 raise LeaseError("Android resource start cancelled before AVD creation")
-            created = run_command(
-                [
-                    options.avdmanager, "create", "avd", "-n", avd_name,
-                    "-k", options.system_image, "-p", avd_path,
-                ],
-                env=environment,
-                timeout=60,
-                log_path=avdmanager_log,
-                input_data=b"no\n",
-                cancelled=cancelled,
-            )
-            if created.returncode:
-                raise _command_error("avdmanager create", created)
-            config_ini = avd_path / "config.ini"
-            if not config_ini.is_file():
-                raise LeaseError(
-                    f"avdmanager reported success without creating the fresh AVD: {avd_path}"
+            if create_avd:
+                created = run_command(
+                    [
+                        options.avdmanager, "create", "avd", "-n", avd_name,
+                        "-k", options.system_image, "-p", avd_path,
+                    ],
+                    env=environment,
+                    timeout=60,
+                    log_path=avdmanager_log,
+                    input_data=b"no\n",
+                    cancelled=cancelled,
                 )
+                if created.returncode:
+                    raise _command_error("avdmanager create", created)
+                if persistent_state is not None:
+                    persistent_state.verify_avd()
+                elif not (avd_path / "config.ini").is_file():
+                    raise LeaseError(
+                        "avdmanager reported success without creating the fresh AVD: "
+                        f"{avd_path}"
+                    )
             if cancelled.is_set():
                 raise LeaseError("Android resource start cancelled after AVD creation")
 
@@ -416,8 +512,10 @@ class AndroidBackend:
                 log_path=emulator_log,
             )
             self._wait_ready(options, child, environment, adb_log, cancelled)
+            if persistent_state is not None and not persistent_state.complete:
+                persistent_state.mark_complete()
             return AndroidResource(
-                self, options, generation, private_home, marker, environment,
+                self, options, generation, private_home, marker, persistent_state, environment,
                 avd_name, child, emulator_log, adb_log,
             )
         except BaseException as failure:
@@ -436,7 +534,8 @@ class AndroidBackend:
                 if child is not None:
                     child.stop(grace=10, kill_timeout=3)
                     self._wait_ports_free(options)
-                _remove_private_home(generation, private_home, marker)
+                if options.state_mode == "clean":
+                    _remove_private_home(generation, private_home, marker)
             except QuarantineError as cleanup_error:
                 raise cleanup_error from failure
             except BaseException as cleanup_error:
@@ -565,7 +664,8 @@ class AndroidResource(Resource):
         options: _Options,
         generation: Path,
         private_home: Path,
-        marker: str,
+        marker: str | None,
+        persistent_state: PersistentAndroidState | None,
         environment: Mapping[str, str],
         avd_name: str,
         child: ManagedProcess,
@@ -577,6 +677,7 @@ class AndroidResource(Resource):
         self._generation = generation
         self._private_home = private_home
         self._marker = marker
+        self._persistent_state = persistent_state
         self._environment = dict(environment)
         self._avd_name = avd_name
         self._child = child
@@ -614,5 +715,10 @@ class AndroidResource(Resource):
             return
         self._child.stop(grace=10, kill_timeout=3)
         self._backend._wait_ports_free(self._options)
-        _remove_private_home(self._generation, self._private_home, self._marker)
+        if self._persistent_state is None:
+            if self._marker is None:
+                raise QuarantineError("disposable Android generation has no ownership marker")
+            _remove_private_home(self._generation, self._private_home, self._marker)
+        else:
+            self._persistent_state.verify_avd()
         self._stopped = True

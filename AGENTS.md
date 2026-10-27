@@ -10,7 +10,8 @@ English. Do not claim support for a backend or platform that has not been tested
 - `resourcelease/store.py`: SQLite authority, requests, credentials, state transitions.
 - `resourcelease/service.py`: scheduling, physical guards, owned worker lifecycle.
 - `resourcelease/process.py`: direct-child supervision and bounded process output.
-- `resourcelease/backends/android.py`: installed SDK tools and disposable AVDs.
+- `resourcelease/backends/android.py`: installed SDK tools and disposable AVDs
+  by default, with explicit persistent state.
 - `resourcelease/cli.py`: commands and private receipt files.
 - `resourcelease/__main__.py`: executable assembly and installed entry point.
 - `tests/`: deterministic tests, including a fake SDK that runs real child processes.
@@ -38,7 +39,9 @@ Runtime code uses the Python standard library. Discuss new runtime dependencies.
    PID adoption, or namespace-switching workarounds without an explicit design
    decision and failure-path tests.
 8. Delete only this invocation's disposable generation data after ownership and
-   teardown checks. A failed exclusive create must never delete existing data.
+   teardown checks. Persistent Android state is separate and is never
+   automatically removed. A failed exclusive create must never delete existing
+   data.
 9. Bound logs, captured output, stored requests and retained diagnostics.
    Preserve quarantine evidence; do not hide cleanup failures.
 

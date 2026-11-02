@@ -47,9 +47,10 @@ SYSTEM_IMAGE = re.compile(
 )
 ANDROID_OPTIONS = frozenset({
     "sdk_root", "java_home", "system_image", "console_port", "memory_mb", "boot_timeout",
-    "state_mode", "state_directory",
+    "state_mode", "state_directory", "device_profile",
 })
 ANDROID_REQUIRED = frozenset({"sdk_root", "java_home", "system_image", "console_port"})
+DEVICE_PROFILE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,127}\Z")
 RADIO_FEATURES = ("BluetoothEmulation", "Uwb", "Nfc", "WiFiPacketStream")
 
 
@@ -63,6 +64,7 @@ class _Options:
     boot_timeout: float
     state_mode: str
     state_directory: Path | None
+    device_profile: str | None
     image_identity: Mapping[str, object]
     avdmanager: Path
     emulator: Path
@@ -192,6 +194,12 @@ def _parse_options(slot: Slot) -> _Options:
     if unexpected:
         raise LeaseError(f"unsupported Android backend options: {', '.join(sorted(unexpected))}")
 
+    device_profile = options.get("device_profile")
+    if "device_profile" in options and (
+        not isinstance(device_profile, str) or not DEVICE_PROFILE.fullmatch(device_profile)
+    ):
+        raise LeaseError("Android device_profile must be a stable SDK device ID")
+
     state_mode = options.get("state_mode", "clean")
     if not isinstance(state_mode, str) or state_mode not in {"clean", "persistent"}:
         raise LeaseError("Android state_mode must be 'clean' or 'persistent'")
@@ -247,7 +255,7 @@ def _parse_options(slot: Slot) -> _Options:
     adb = _executable(sdk_root / "platform-tools" / "adb", "adb")
     return _Options(
         sdk_root, java_home, system_image, port, memory, timeout, state_mode,
-        state_directory, image_identity,
+        state_directory, device_profile, image_identity,
         avdmanager, emulator, adb,
     )
 
@@ -439,6 +447,7 @@ class AndroidBackend:
                 system_image=options.system_image,
                 image_identity=options.image_identity,
                 memory_mb=options.memory_mb,
+                device_profile=options.device_profile,
             )
             private_home = persistent_state.private_home
             avd_home = persistent_state.avd_home
@@ -472,6 +481,8 @@ class AndroidBackend:
                     [
                         options.avdmanager, "create", "avd", "-n", avd_name,
                         "-k", options.system_image, "-p", avd_path,
+                        *(["--device", options.device_profile]
+                          if options.device_profile is not None else []),
                     ],
                     env=environment,
                     timeout=60,

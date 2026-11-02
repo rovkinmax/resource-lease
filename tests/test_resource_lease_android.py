@@ -345,6 +345,105 @@ class AndroidBackendTests(unittest.TestCase):
         generation.mkdir(mode=0o700)
         return generation
 
+    def device_profile_slot(self, profile, state_directory: Path | None = None) -> Slot:
+        base = self.slot() if state_directory is None else self.persistent_slot(state_directory)
+        return Slot(base.id, base.capabilities, base.backend,
+                    {**base.options, "device_profile": profile})
+
+    def test_device_profile_clean_argv_and_cleanup(self):
+        generation = self.generation()
+        resource = self.backend.start(self.device_profile_slot("tv_1080p"), generation, Event())
+        self.addCleanup(resource.stop)
+        args = self.sdk.calls("avdmanager")[0]["args"]
+        name = args[args.index("-n") + 1]
+        path = args[args.index("-p") + 1]
+        self.assertEqual(args, [
+            "create", "avd", "-n", name, "-k", SYSTEM_IMAGE, "-p", path,
+            "--device", "tv_1080p",
+        ])
+        resource.stop()
+        self.assertFalse((generation / "android-home").exists())
+
+    def test_device_profile_invalid_values_fail_before_state_or_sdk(self):
+        state = self.root / "invalid-profile-state"
+        for value in (None, True, False, 1, 1.5, [], {}, "1", "", " ", "tv 1080p", "../tv",
+                      "/tv", "--device", "tv\n", "a" * 129):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(LeaseError, "device_profile"):
+                    self.backend.keys(self.device_profile_slot(value, state))
+                self.assertFalse(state.exists())
+                self.assertEqual(self.sdk.calls(), [])
+
+    def test_device_profile_stable_ids_preserve_physical_keys(self):
+        expected = self.backend.keys(self.slot())
+        for value in ("tv_1080p", "a", "A-._0", "a" * 128):
+            with self.subTest(value=value):
+                self.assertEqual(self.backend.keys(self.device_profile_slot(value)), expected)
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_device_profile_persistent_reuse_and_mismatches_preserve_state(self):
+        state = self.root / "tv-state"
+        slot = self.device_profile_slot("tv_1080p", state)
+        first = self.backend.start(slot, self.generation(), Event())
+        self.addCleanup(first.stop)
+        args = self.sdk.calls("avdmanager")[0]["args"]
+        avd = Path(args[args.index("-p") + 1])
+        marker = avd / "userdata-qemu.img"
+        marker.write_bytes(b"owned TV marker")
+        first.stop()
+        manifest = state / ".resource-lease-android-state.json"
+        before = {path: path.read_bytes() for path in (manifest, avd / "config.ini", marker)}
+        self.assertEqual(json.loads(before[manifest])["profile"]["device_profile"], "tv_1080p")
+        second_generation = self.root / "tv-reuse"
+        second_generation.mkdir(mode=0o700)
+        second = self.backend.start(slot, second_generation, Event())
+        self.addCleanup(second.stop)
+        second.stop()
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+        for index, other in enumerate((
+            self.device_profile_slot("tv_720p", state), self.persistent_slot(state),
+        )):
+            generation = self.root / f"tv-mismatch-{index}"
+            generation.mkdir(mode=0o700)
+            with self.assertRaisesRegex(LeaseError, "profile differs"):
+                self.backend.start(other, generation, Event())
+            self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_device_profile_cannot_adopt_omitted_profile_state(self):
+        state = self.root / "default-state"
+        first = self.backend.start(self.persistent_slot(state), self.generation(), Event())
+        self.addCleanup(first.stop)
+        first.stop()
+        manifest = state / ".resource-lease-android-state.json"
+        before = manifest.read_bytes()
+        self.assertEqual(set(json.loads(before)["profile"]),
+                         {"system_image", "image_identity", "memory_mb"})
+        generation = self.root / "explicit-after-default"
+        generation.mkdir(mode=0o700)
+        with self.assertRaisesRegex(LeaseError, "profile differs"):
+            self.backend.start(self.device_profile_slot("tv_1080p", state), generation, Event())
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+
+    def test_device_profile_sdk_failure_preserves_partial_state_without_retry(self):
+        self.sdk.configure(avdmanager="create-fail")
+        state = self.root / "unavailable-profile-state"
+        slot = self.device_profile_slot("unavailable_profile", state)
+        with self.assertRaises(LeaseError):
+            self.backend.start(slot, self.generation(), Event())
+        manifest = state / ".resource-lease-android-state.json"
+        before = manifest.read_bytes()
+        self.assertEqual(json.loads(before)["status"], "initializing")
+        self.assertEqual(json.loads(before)["profile"]["device_profile"], "unavailable_profile")
+        self.sdk.configure(avdmanager="ready")
+        generation = self.root / "retry-unavailable"
+        generation.mkdir(mode=0o700)
+        with self.assertRaisesRegex(LeaseError, "initialization is incomplete"):
+            self.backend.start(slot, generation, Event())
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+
     def assert_private_home_removed(self, generation: Path) -> None:
         self.assertFalse((generation / "android-home").exists())
 
@@ -422,6 +521,11 @@ class AndroidBackendTests(unittest.TestCase):
         self.assertEqual(manifest["status"], "complete")
         self.assertEqual(manifest["profile"]["system_image"], SYSTEM_IMAGE)
         self.assertEqual(manifest["profile"]["memory_mb"], 2048)
+        self.assertEqual(set(manifest["profile"]),
+                         {"system_image", "image_identity", "memory_mb"})
+        self.assertEqual(avd_args, [
+            "create", "avd", "-n", avd_name, "-k", SYSTEM_IMAGE, "-p", str(avd_path),
+        ])
         self.assertTrue(state_directory.is_dir())
         self.assertFalse(state_directory.is_relative_to(first_generation))
 

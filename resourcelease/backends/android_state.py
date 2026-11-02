@@ -181,6 +181,7 @@ class PersistentAndroidState:
         system_image: str,
         image_identity: Mapping[str, object],
         memory_mb: int,
+        device_profile: str | None = None,
     ) -> "PersistentAndroidState":
         identity = state_identity(directory)
         avd_name = f"resource_lease_{identity[:16]}"
@@ -189,6 +190,8 @@ class PersistentAndroidState:
             "image_identity": dict(image_identity),
             "memory_mb": memory_mb,
         }
+        if device_profile is not None:
+            profile["device_profile"] = device_profile
         try:
             directory.mkdir(mode=0o700, exist_ok=False)
         except FileExistsError:

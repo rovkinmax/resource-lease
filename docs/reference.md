@@ -54,6 +54,28 @@ Use exact-serial ADB commands while holding the lease. Complete device work
 before release. Losing the lease means stop using the endpoint immediately.
 The tool does not run, stop, or inspect Gradle, IDE, or arbitrary caller jobs.
 
+## Android device profiles
+
+Android slots optionally accept `device_profile`, a stable device ID from the
+installed SDK, such as `tv_1080p`. See `examples/android-tv.json`. The backend
+passes this ID to `avdmanager create avd --device`; it does not download an SDK
+or infer a hardware profile from the image tag. A Google TV image alone does
+not select a landscape TV device: without this option the SDK's default
+hardware configuration is preserved.
+
+IDs must start with an ASCII letter and contain at most 128 ASCII letters,
+digits, underscores, dots or hyphens. Numeric device indexes, null, whitespace,
+paths and arbitrary command arguments are rejected. A valid-looking ID absent
+from the installed SDK fails through the normal AVD creation error path.
+
+Omitting the option preserves existing clean behavior and the existing
+persistent manifest profile exactly. Explicit selection becomes part of the
+persistent profile: changing it, adding it to existing default-profile state,
+or removing it fails closed without editing or deleting that state. Use a
+separately authorized new state directory for an incompatible device profile;
+do not copy authentication or adopt developer AVD data. Failed persistent
+initialization remains preserved and is not automatically retried.
+
 ## Android state modes
 
 Android slots accept `state_mode: "clean" | "persistent"`. Omitting

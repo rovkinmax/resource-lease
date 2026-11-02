@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "lease_seconds": 120,
+  "max_requests": 1024,
+  "history_seconds": 3600,
+  "slots": [
+    {
+      "id": "android-tv",
+      "backend": "android",
+      "capabilities": ["android-tv"],
+      "options": {
+        "sdk_root": "/absolute/path/to/Android/sdk",
+        "java_home": "/absolute/path/to/jdk",
+        "system_image": "system-images;android-36;google-tv;arm64-v8a",
+        "device_profile": "tv_1080p",
+        "state_mode": "clean",
+        "console_port": 5574,
+        "memory_mb": 2048,
+        "boot_timeout": 180
+      }
+    }
+  ]
+}

@@ -202,6 +202,9 @@ def make_fake_android_sdk(root: Path, *, mode: str = "ready") -> FakeAndroidSDK:
         path.parent.mkdir(parents=True, exist_ok=True)
     image.parent.mkdir(parents=True, exist_ok=True)
     image.write_bytes(b"deterministic fake installed system image")
+    (image.parent / "source.properties").write_text(
+        "Pkg.Revision=1.0.0\n", encoding="utf-8",
+    )
     control_path = root / "control.json"
     control_path.write_text(json.dumps({"mode": mode}), encoding="utf-8")
     trace_path = root / "calls.jsonl"
@@ -225,8 +228,8 @@ def make_fake_android_sdk(root: Path, *, mode: str = "ready") -> FakeAndroidSDK:
     return FakeAndroidSDK(root, sdk_root, java_home, control_path, trace_path)
 
 
-def free_console_port() -> int:
-    for port in range(5554, 5683, 2):
+def free_console_port(start: int = 5554) -> int:
+    for port in range(start, 5683, 2):
         sockets = []
         try:
             for candidate in (port, port + 1):
@@ -323,10 +326,123 @@ class AndroidBackendTests(unittest.TestCase):
         options = self.sdk.options(port or self.port, **overrides)
         return Slot("android-test", ("android-api-34",), "android", options)
 
+    def persistent_slot(
+        self,
+        state_directory: Path,
+        *,
+        port: int | None = None,
+        **overrides,
+    ) -> Slot:
+        options = self.sdk.options(port or self.port, **overrides)
+        options.update(
+            state_mode="persistent",
+            state_directory=str(state_directory),
+        )
+        return Slot("android-test", ("android-api-34",), "android", options)
+
     def generation(self) -> Path:
         generation = self.root / "generation"
         generation.mkdir(mode=0o700)
         return generation
+
+    def device_profile_slot(self, profile, state_directory: Path | None = None) -> Slot:
+        base = self.slot() if state_directory is None else self.persistent_slot(state_directory)
+        return Slot(base.id, base.capabilities, base.backend,
+                    {**base.options, "device_profile": profile})
+
+    def test_device_profile_clean_argv_and_cleanup(self):
+        generation = self.generation()
+        resource = self.backend.start(self.device_profile_slot("tv_1080p"), generation, Event())
+        self.addCleanup(resource.stop)
+        args = self.sdk.calls("avdmanager")[0]["args"]
+        name = args[args.index("-n") + 1]
+        path = args[args.index("-p") + 1]
+        self.assertEqual(args, [
+            "create", "avd", "-n", name, "-k", SYSTEM_IMAGE, "-p", path,
+            "--device", "tv_1080p",
+        ])
+        resource.stop()
+        self.assertFalse((generation / "android-home").exists())
+
+    def test_device_profile_invalid_values_fail_before_state_or_sdk(self):
+        state = self.root / "invalid-profile-state"
+        for value in (None, True, False, 1, 1.5, [], {}, "1", "", " ", "tv 1080p", "../tv",
+                      "/tv", "--device", "tv\n", "a" * 129):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(LeaseError, "device_profile"):
+                    self.backend.keys(self.device_profile_slot(value, state))
+                self.assertFalse(state.exists())
+                self.assertEqual(self.sdk.calls(), [])
+
+    def test_device_profile_stable_ids_preserve_physical_keys(self):
+        expected = self.backend.keys(self.slot())
+        for value in ("tv_1080p", "a", "A-._0", "a" * 128):
+            with self.subTest(value=value):
+                self.assertEqual(self.backend.keys(self.device_profile_slot(value)), expected)
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_device_profile_persistent_reuse_and_mismatches_preserve_state(self):
+        state = self.root / "tv-state"
+        slot = self.device_profile_slot("tv_1080p", state)
+        first = self.backend.start(slot, self.generation(), Event())
+        self.addCleanup(first.stop)
+        args = self.sdk.calls("avdmanager")[0]["args"]
+        avd = Path(args[args.index("-p") + 1])
+        marker = avd / "userdata-qemu.img"
+        marker.write_bytes(b"owned TV marker")
+        first.stop()
+        manifest = state / ".resource-lease-android-state.json"
+        before = {path: path.read_bytes() for path in (manifest, avd / "config.ini", marker)}
+        self.assertEqual(json.loads(before[manifest])["profile"]["device_profile"], "tv_1080p")
+        second_generation = self.root / "tv-reuse"
+        second_generation.mkdir(mode=0o700)
+        second = self.backend.start(slot, second_generation, Event())
+        self.addCleanup(second.stop)
+        second.stop()
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+        for index, other in enumerate((
+            self.device_profile_slot("tv_720p", state), self.persistent_slot(state),
+        )):
+            generation = self.root / f"tv-mismatch-{index}"
+            generation.mkdir(mode=0o700)
+            with self.assertRaisesRegex(LeaseError, "profile differs"):
+                self.backend.start(other, generation, Event())
+            self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_device_profile_cannot_adopt_omitted_profile_state(self):
+        state = self.root / "default-state"
+        first = self.backend.start(self.persistent_slot(state), self.generation(), Event())
+        self.addCleanup(first.stop)
+        first.stop()
+        manifest = state / ".resource-lease-android-state.json"
+        before = manifest.read_bytes()
+        self.assertEqual(set(json.loads(before)["profile"]),
+                         {"system_image", "image_identity", "memory_mb"})
+        generation = self.root / "explicit-after-default"
+        generation.mkdir(mode=0o700)
+        with self.assertRaisesRegex(LeaseError, "profile differs"):
+            self.backend.start(self.device_profile_slot("tv_1080p", state), generation, Event())
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+
+    def test_device_profile_sdk_failure_preserves_partial_state_without_retry(self):
+        self.sdk.configure(avdmanager="create-fail")
+        state = self.root / "unavailable-profile-state"
+        slot = self.device_profile_slot("unavailable_profile", state)
+        with self.assertRaises(LeaseError):
+            self.backend.start(slot, self.generation(), Event())
+        manifest = state / ".resource-lease-android-state.json"
+        before = manifest.read_bytes()
+        self.assertEqual(json.loads(before)["status"], "initializing")
+        self.assertEqual(json.loads(before)["profile"]["device_profile"], "unavailable_profile")
+        self.sdk.configure(avdmanager="ready")
+        generation = self.root / "retry-unavailable"
+        generation.mkdir(mode=0o700)
+        with self.assertRaisesRegex(LeaseError, "initialization is incomplete"):
+            self.backend.start(slot, generation, Event())
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
 
     def assert_private_home_removed(self, generation: Path) -> None:
         self.assertFalse((generation / "android-home").exists())
@@ -336,6 +452,230 @@ class AndroidBackendTests(unittest.TestCase):
             self.backend.keys(self.slot()),
             (f"tcp-port:{self.port}", f"tcp-port:{self.port + 1}"),
         )
+
+    def test_persistent_mode_uses_canonical_state_guard_without_creating_state(self):
+        self.assertEqual(
+            self.backend.keys(self.slot()),
+            (f"tcp-port:{self.port}", f"tcp-port:{self.port + 1}"),
+        )
+        parent = self.root / "persistent-parent"
+        parent.mkdir(mode=0o700)
+        state_directory = parent / "android-state"
+        options = self.sdk.options(self.port)
+        options.update(state_mode="persistent", state_directory=str(state_directory))
+        slot = Slot("android-persistent", ("android-api-34",), "android", options)
+
+        keys = self.backend.keys(slot)
+        state_keys = tuple(key for key in keys if key.startswith("android-state:"))
+        self.assertEqual(len(state_keys), 1)
+        self.assertFalse(state_directory.exists(), "key discovery must not create persistent state")
+
+        alias = self.root / "persistent-parent-alias"
+        alias.symlink_to(parent, target_is_directory=True)
+        alias_options = self.sdk.options(self.port)
+        alias_options.update(
+            state_mode="persistent",
+            state_directory=str(alias / "android-state"),
+        )
+        alias_slot = Slot("android-persistent-alias", ("android-api-34",), "android",
+                          alias_options)
+        alias_keys = self.backend.keys(alias_slot)
+        self.assertEqual(
+            state_keys,
+            tuple(key for key in alias_keys if key.startswith("android-state:")),
+            "different path spellings must guard one canonical AVD state",
+        )
+
+    def test_persistent_mode_configuration_is_explicit_and_closed(self):
+        options = self.sdk.options(self.port)
+        options["state_mode"] = "persistent"
+        with self.assertRaisesRegex(LeaseError, "state_directory"):
+            self.backend.keys(Slot("android-test", ("test",), "android", options))
+
+        options["state_directory"] = str(self.root / "persistent")
+        options["state_mode"] = "other"
+        with self.assertRaisesRegex(LeaseError, "state_mode"):
+            self.backend.keys(Slot("android-test", ("test",), "android", options))
+
+        options["state_mode"] = "clean"
+        with self.assertRaisesRegex(LeaseError, "only valid"):
+            self.backend.keys(Slot("android-test", ("test",), "android", options))
+
+    def test_persistent_avd_is_reused_and_survives_release(self):
+        state_directory = self.root / "persistent-state"
+        first_generation = self.generation()
+        first = self.backend.start(
+            self.persistent_slot(state_directory), first_generation, Event(),
+        )
+        self.addCleanup(first.stop)
+        avd_call = self.sdk.calls("avdmanager")[0]
+        avd_args = avd_call["args"]
+        avd_name = avd_args[avd_args.index("-n") + 1]
+        avd_path = Path(avd_args[avd_args.index("-p") + 1])
+        marker = avd_path / "userdata-qemu.img"
+        marker.write_bytes(b"persistent fake user data")
+
+        manifest_path = state_directory / ".resource-lease-android-state.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["owner"], "resource-lease")
+        self.assertEqual(manifest["status"], "complete")
+        self.assertEqual(manifest["profile"]["system_image"], SYSTEM_IMAGE)
+        self.assertEqual(manifest["profile"]["memory_mb"], 2048)
+        self.assertEqual(set(manifest["profile"]),
+                         {"system_image", "image_identity", "memory_mb"})
+        self.assertEqual(avd_args, [
+            "create", "avd", "-n", avd_name, "-k", SYSTEM_IMAGE, "-p", str(avd_path),
+        ])
+        self.assertTrue(state_directory.is_dir())
+        self.assertFalse(state_directory.is_relative_to(first_generation))
+
+        first.stop()
+        self.assertTrue(marker.exists(), "release deleted persistent AVD data")
+        self.assertFalse((first_generation / "android-home").exists())
+
+        second_generation = self.root / "generation-two"
+        second_generation.mkdir(mode=0o700)
+        second = self.backend.start(
+            self.persistent_slot(state_directory), second_generation, Event(),
+        )
+        self.addCleanup(second.stop)
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+        emulator_calls = self.sdk.calls("emulator")
+        self.assertEqual(len(emulator_calls), 2)
+        second_args = emulator_calls[1]["args"]
+        self.assertEqual(second_args[second_args.index("-avd") + 1], avd_name)
+        self.assertEqual(marker.read_bytes(), b"persistent fake user data")
+        second.stop()
+        self.assertTrue(marker.exists(), "later release deleted persistent AVD data")
+
+    def test_unknown_persistent_directory_is_never_adopted_or_deleted(self):
+        state_directory = self.root / "unmarked-state"
+        state_directory.mkdir(mode=0o700)
+        sentinel = state_directory / "operator-data"
+        sentinel.write_text("not owned by this backend", encoding="utf-8")
+
+        with self.assertRaisesRegex(LeaseError, "persistent Android manifest"):
+            self.backend.start(
+                self.persistent_slot(state_directory), self.generation(), Event(),
+            )
+        self.assertTrue(sentinel.exists())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "not owned by this backend")
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_partial_persistent_initialization_is_retained_and_not_retried(self):
+        state_directory = self.root / "partial-state"
+        slot = self.persistent_slot(state_directory)
+        self.sdk.configure(avdmanager="create-fail")
+        with self.assertRaisesRegex(LeaseError, "fixture avdmanager failure"):
+            self.backend.start(slot, self.generation(), Event())
+
+        manifest_path = state_directory / ".resource-lease-android-state.json"
+        manifest_before = manifest_path.read_bytes()
+        self.assertEqual(json.loads(manifest_before)["status"], "initializing")
+        avd_files_before = sorted(
+            path.relative_to(state_directory).as_posix()
+            for path in state_directory.rglob("*")
+        )
+        self.assertTrue(any(path.endswith("config.ini") for path in avd_files_before))
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+
+        second_generation = self.root / "generation-two"
+        second_generation.mkdir(mode=0o700)
+        with self.assertRaisesRegex(LeaseError, "initialization is incomplete"):
+            self.backend.start(slot, second_generation, Event())
+        self.assertEqual(manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(
+            sorted(path.relative_to(state_directory).as_posix()
+                   for path in state_directory.rglob("*")),
+            avd_files_before,
+        )
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+
+    def test_incompatible_persistent_image_and_memory_profiles_are_preserved(self):
+        state_directory = self.root / "incompatible-state"
+        first = self.backend.start(
+            self.persistent_slot(state_directory), self.generation(), Event(),
+        )
+        self.addCleanup(first.stop)
+        avd_path = Path(self.sdk.calls("avdmanager")[0]["args"][-1])
+        marker = avd_path / "userdata-qemu.img"
+        marker.write_bytes(b"must survive profile mismatch")
+        first.stop()
+        manifest_path = state_directory / ".resource-lease-android-state.json"
+        manifest_before = manifest_path.read_bytes()
+
+        properties = (
+            self.sdk.sdk_root / "system-images" / "android-34" / "google_apis"
+            / "arm64-v8a" / "source.properties"
+        )
+        properties.write_text("Pkg.Revision=2.0.0\n", encoding="utf-8")
+        generation_two = self.root / "generation-two"
+        generation_two.mkdir(mode=0o700)
+        with self.assertRaisesRegex(LeaseError, "profile differs"):
+            self.backend.start(
+                self.persistent_slot(state_directory),
+                generation_two,
+                Event(),
+            )
+        properties.write_text("Pkg.Revision=1.0.0\n", encoding="utf-8")
+
+        generation_three = self.root / "generation-three"
+        generation_three.mkdir(mode=0o700)
+        with self.assertRaisesRegex(LeaseError, "profile differs"):
+            self.backend.start(
+                self.persistent_slot(state_directory, memory_mb=1024),
+                generation_three,
+                Event(),
+            )
+        self.assertEqual(manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(marker.read_bytes(), b"must survive profile mismatch")
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+        self.assertEqual(len(self.sdk.calls("emulator")), 1)
+
+    def test_persistent_state_outside_generation_pruning_tree(self):
+        pool_root = self.root / "pool"
+        generations = pool_root / "generations"
+        generations.mkdir(parents=True, mode=0o700)
+        generation = generations / "lease"
+        generation.mkdir(mode=0o700)
+        state_directory = generations / "persistent-state"
+        slot = self.persistent_slot(state_directory)
+        with self.assertRaisesRegex(LeaseError, "outside generations"):
+            self.backend.start(slot, generation, Event())
+        self.assertFalse(state_directory.exists())
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_persistent_startup_quarantine_preserves_partial_state(self):
+        state_directory = self.root / "quarantined-state"
+        generation = self.generation()
+        captured: list[ManagedProcess] = []
+        original_stop = ManagedProcess.stop
+
+        def quarantine_after_spawn(*args):
+            child = args[1]
+            captured.append(child)
+            self.addCleanup(lambda child=child: original_stop(child))
+            marker = self.root / "fake-sdk" / "emulator-started"
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not marker.exists():
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), "fake emulator did not reach direct-child state")
+            raise QuarantineError("injected persistent startup uncertainty")
+
+        with mock.patch.object(self.backend, "_wait_ready", side_effect=quarantine_after_spawn):
+            with self.assertRaisesRegex(QuarantineError, "persistent startup uncertainty"):
+                self.backend.start(
+                    self.persistent_slot(state_directory), generation, Event(),
+                )
+
+        self.assertEqual(len(captured), 1)
+        self.assertIsNotNone(captured[0].poll())
+        manifest = json.loads(
+            (state_directory / ".resource-lease-android-state.json").read_text()
+        )
+        self.assertEqual(manifest["status"], "initializing")
+        self.assertTrue((state_directory / "android-home" / "avd").is_dir())
+        self.assertTrue(all(self._port_free(port) for port in (self.port, self.port + 1)))
 
     def test_invalid_options_are_rejected_before_start(self):
         cases = [

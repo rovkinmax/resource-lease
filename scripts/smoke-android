@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run an opt-in three-generation lifecycle using the public CLI and exact-serial ADB."""
+"""Run an opt-in three-lease lifecycle using the public CLI and exact-serial ADB."""
 import argparse
 import json
 import os
@@ -12,6 +12,7 @@ import uuid
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("clean", "persistent"), required=True)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True,
@@ -26,7 +27,18 @@ def main():
     slot = config["slots"][0]
     if slot.get("backend") != "android":
         parser.error("smoke requires an Android slot")
-    adb = Path(slot["options"]["sdk_root"]) / "platform-tools" / "adb"
+    options = slot["options"]
+    configured_mode = options.get("state_mode", "clean")
+    if configured_mode != args.mode:
+        parser.error(f"config state_mode must match --mode {args.mode}")
+    if args.mode == "persistent":
+        state_directory = options.get("state_directory")
+        if not isinstance(state_directory, str) or not state_directory.strip():
+            parser.error("persistent smoke requires state_directory")
+    elif "state_directory" in options:
+        parser.error("clean smoke does not accept state_directory")
+
+    adb = Path(options["sdk_root"]) / "platform-tools" / "adb"
     command = [sys.executable, "-I", str(args.package.resolve()), "--root", str(root)]
     environment = {key: value for key, value in os.environ.items()
                    if key != "PYTHONPATH" and not key.startswith("KENT")}
@@ -50,6 +62,12 @@ def main():
         if completed.returncode:
             raise RuntimeError(f"ADB observation failed: {completed.stderr[-4096:]}")
         return completed.stdout.strip()
+
+    def assert_marker(serial, present):
+        if present:
+            device(serial, "shell", "test", "-e", marker)
+        else:
+            device(serial, "shell", "test", "!", "-e", marker)
 
     try:
         call("init", "--config", args.config.resolve())
@@ -88,19 +106,30 @@ def main():
             raise RuntimeError(f"second acquisition failed: {err[-4096:]}")
         second = json.loads(out)
         assert second["generation"] == first["generation"] + 1
-        device(second["endpoint"]["adb_serial"], "shell", "test", "!", "-e", marker)
+        assert_marker(second["endpoint"]["adb_serial"], args.mode == "persistent")
         third = call(*acquisition("smoke-c", receipts[2]))
         assert third["generation"] == second["generation"] + 1
         expired = call("inspect", "--owner", "smoke-b", "--lease", receipts[1])
         assert expired["state"] == "expired" and not expired["cleanup_pending"]
+        assert_marker(third["endpoint"]["adb_serial"], args.mode == "persistent")
         assert device(third["endpoint"]["adb_serial"],
                       "shell", "getprop", "ro.build.version.sdk") == api
         call("release", "--owner", "smoke-c", "--lease", receipts[2])
         result = call("shutdown")
         assert result["service"]["state"] == "stopped"
         assert all(s["state"] == "idle" for s in result["slots"])
-        print(json.dumps({"passed": True, "android_api": api, "generations": 3,
-                          "service": "stopped", "slot": "idle"}))
+        report = {"passed": True, "mode": args.mode, "android_api": api,
+                  "generations": 3, "service": "stopped", "slot": "idle"}
+        if args.mode == "persistent":
+            state_directory = Path(options["state_directory"]).expanduser()
+            manifest_path = state_directory / ".resource-lease-android-state.json"
+            if not state_directory.is_dir() or not manifest_path.is_file():
+                raise RuntimeError("persistent Android state was not retained after shutdown")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("status") != "complete":
+                raise RuntimeError("persistent Android state is not complete after shutdown")
+            report["persistent_state_retained"] = True
+        print(json.dumps(report))
     finally:
         if waiting is not None and waiting.poll() is None:
             waiting.terminate()

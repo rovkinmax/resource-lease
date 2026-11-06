@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "lease_seconds": 120,
+  "max_requests": 1024,
+  "history_seconds": 3600,
+  "slots": [
+    {
+      "id": "android-34-persistent",
+      "backend": "android",
+      "capabilities": ["android-api-34"],
+      "options": {
+        "sdk_root": "/absolute/path/to/Android/sdk",
+        "java_home": "/absolute/path/to/jdk",
+        "system_image": "system-images;android-34;google_apis;arm64-v8a",
+        "state_mode": "persistent",
+        "state_directory": "/absolute/private/path/to/resource-lease/android-state",
+        "console_port": 5574,
+        "memory_mb": 2048,
+        "boot_timeout": 180
+      }
+    }
+  ]
+}

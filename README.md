@@ -4,7 +4,8 @@ A small CLI for jobs that need exclusive access to an Android emulator.
 
 Each job asks for an emulator and gets a lease. If all matching emulators are
 busy, the job waits in a queue. When a job finishes—or stops renewing its
-lease—the service stops that emulator. The next job gets a fresh one.
+lease—the service stops that emulator. By default the next job gets a fresh
+AVD; an explicitly configured persistent mode reuses a private managed AVD.
 
 Set how many emulators may run at once; jobs wait their turn.
 The tool runs locally and has no third-party Python runtime dependencies.
@@ -46,7 +47,8 @@ and use `python3 resource-lease.pyz` in place of `resource-lease`.
 Copy [examples/android.json](examples/android.json) to a file outside this
 checkout. Set `sdk_root` and `java_home` to absolute paths, and choose an installed
 `system_image`. The example uses an ARM64 image; use an image that matches your
-host. Reserve an unused console port and its following port for ADB.
+host. Reserve an unused console port and its following port for ADB. The
+example selects `state_mode: "clean"`, which is also the default.
 
 A *slot* is capacity for one emulator, not an existing device. The example has
 one slot. Add slots with distinct port pairs to allow more jobs at once.
@@ -60,6 +62,14 @@ resource-lease --root "$RESOURCE_POOL" start
 
 `start` runs a background service. It starts an emulator only when a job needs
 one. `init` is a one-time operation and will not overwrite an existing pool.
+
+To retain AVD data between leases, use
+[examples/android-persistent.json](examples/android-persistent.json) and set a
+private `state_directory`. Its parent must already exist and be owned by you.
+The tool creates only an absent state directory, and reuses an existing one
+only when its complete ownership manifest and Android profile match. Unknown,
+partial, or incompatible state is preserved and rejected; persistent data is
+outside request generations and diagnostic pruning.
 
 ## Use an emulator
 
@@ -107,7 +117,7 @@ resource-lease --root "$RESOURCE_POOL" release --owner job-42 --lease "$LEASE"
 
 Release waits for teardown. If the job disappears, the service notices that
 renewal has stopped and cleans up after the lease expires. The next job receives
-a new emulator with no data from this one.
+a fresh AVD in clean mode, or the same managed AVD in persistent mode.
 
 ### Check or stop the pool
 

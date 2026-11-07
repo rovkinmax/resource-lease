@@ -50,7 +50,6 @@ ANDROID_OPTIONS = frozenset({
     "state_mode", "state_directory",
 })
 ANDROID_REQUIRED = frozenset({"sdk_root", "java_home", "system_image", "console_port"})
-RADIO_FEATURES = ("BluetoothEmulation", "Uwb", "Nfc", "WiFiPacketStream")
 
 
 @dataclass(frozen=True)
@@ -67,10 +66,23 @@ class _Options:
     avdmanager: Path
     emulator: Path
     adb: Path
+    netsimd: Path
 
     @property
     def adb_port(self) -> int:
         return self.console_port + 1
+
+    @property
+    def grpc_port(self) -> int:
+        return self.console_port + 10000
+
+    @property
+    def hci_port(self) -> int:
+        return self.console_port + 20000
+
+    @property
+    def ports(self) -> tuple[int, ...]:
+        return self.console_port, self.adb_port, self.grpc_port, self.hci_port
 
     def environment(self, private_home: Path, avd_home: Path) -> dict[str, str]:
         # Keep the caller's real HOME: SDK launcher scripts and the host runtime
@@ -245,10 +257,11 @@ def _parse_options(slot: Slot) -> _Options:
     avdmanager = _find_avdmanager(sdk_root)
     emulator = _executable(sdk_root / "emulator" / "emulator", "emulator")
     adb = _executable(sdk_root / "platform-tools" / "adb", "adb")
+    netsimd = _executable(sdk_root / "emulator" / "netsimd", "netsimd")
     return _Options(
         sdk_root, java_home, system_image, port, memory, timeout, state_mode,
         state_directory, image_identity,
-        avdmanager, emulator, adb,
+        avdmanager, emulator, adb, netsimd,
     )
 
 
@@ -285,7 +298,7 @@ def _port_bindable(port: int) -> bool:
 
 
 def _assert_ports_free(options: _Options) -> None:
-    for port in (options.console_port, options.adb_port):
+    for port in options.ports:
         if not _port_bindable(port):
             raise LeaseError(f"Android emulator port {port} is already in use")
 
@@ -409,7 +422,7 @@ class AndroidBackend:
 
     def keys(self, slot: Slot) -> tuple[str, ...]:
         options = _parse_options(slot)
-        keys = [f"tcp-port:{options.console_port}", f"tcp-port:{options.adb_port}"]
+        keys = [f"tcp-port:{port}" for port in options.ports]
         if options.state_mode == "persistent":
             assert options.state_directory is not None
             keys.append(f"android-state:{state_identity(options.state_directory)}")
@@ -458,13 +471,25 @@ class AndroidBackend:
             avd_name = f"resource_lease_{uuid.uuid4().hex[:16]}"
             avd_path = avd_home / f"{avd_name}.avd"
             create_avd = True
+        if persistent_state is not None:
+            runtime_home, _, marker = _create_private_home(generation)
+        else:
+            runtime_home = private_home
         environment = options.environment(private_home, avd_home)
         avdmanager_log = generation / "android-avdmanager.log"
         emulator_log = generation / "android-emulator.log"
         adb_log = generation / "android-adb.log"
         child: ManagedProcess | None = None
+        netsimd: ManagedProcess | None = None
 
         try:
+            temporary = runtime_home / "netsim-tmp"
+            temporary.mkdir(mode=0o700)
+            child_environment = {
+                key: value for key, value in environment.items()
+                if key != "ANDROID_EMULATOR_FEATURES" and not key.startswith("NETSIM_")
+            }
+            child_environment.update(TMPDIR=str(temporary), ANDROID_TMP=str(temporary))
             if cancelled.is_set():
                 raise LeaseError("Android resource start cancelled before AVD creation")
             if create_avd:
@@ -493,6 +518,19 @@ class AndroidBackend:
 
             # A foreign process may have claimed a port while avdmanager ran.
             _assert_ports_free(options)
+            deadline = time.monotonic() + options.boot_timeout
+            netsimd = launch_child(
+                [
+                    options.netsimd, "--instance", str(options.console_port),
+                    "--grpc-port", str(options.grpc_port),
+                    "--hci-port", str(options.hci_port),
+                    "--logtostderr", "--no-cli-ui", "--no-web-ui", "--no-test-beacons",
+                    "--startup-timeout", str(math.ceil(options.boot_timeout * 1000)),
+                ],
+                env=child_environment,
+                log_path=generation / "android-netsimd.log",
+            )
+            self._wait_transport(options, netsimd, deadline, cancelled)
             child = launch_child(
                 [
                     options.emulator,
@@ -501,41 +539,35 @@ class AndroidBackend:
                     "-memory", str(options.memory_mb),
                     "-no-window",
                     "-no-snapshot",
-                    "-no-audio",
                     "-no-boot-anim",
                     "-no-metrics",
                     "-crash-report-mode", "disabled",
-                    *[flag for feature in RADIO_FEATURES
-                      for flag in ("-feature", f"-{feature}")],
+                    "-packet-streamer-endpoint", f"127.0.0.1:{options.grpc_port}",
                 ],
-                env=environment,
+                env=child_environment,
                 log_path=emulator_log,
             )
-            self._wait_ready(options, child, environment, adb_log, cancelled)
+            self._wait_ready(options, child, environment, adb_log, cancelled, netsimd, deadline)
             if persistent_state is not None and not persistent_state.complete:
                 persistent_state.mark_complete()
             return AndroidResource(
-                self, options, generation, private_home, marker, persistent_state, environment,
-                avd_name, child, emulator_log, adb_log,
+                self, options, generation, runtime_home, marker, persistent_state, environment,
+                avd_name, child, emulator_log, adb_log, netsimd,
             )
         except BaseException as failure:
             if isinstance(failure, QuarantineError):
-                if child is not None:
-                    try:
-                        child.stop(grace=10, kill_timeout=3)
-                    except BaseException as stop_error:
-                        if hasattr(failure, "add_note"):
-                            failure.add_note(
-                                "known emulator child could not be stopped; "
-                                f"generation preserved: {stop_error}"
-                            )
+                try:
+                    self._stop_children(child, netsimd)
+                    self._wait_ports_free(options)
+                except BaseException as stop_error:
+                    if hasattr(failure, "add_note"):
+                        failure.add_note(f"child cleanup uncertain; generation preserved: {stop_error}")
                 raise
             try:
-                if child is not None:
-                    child.stop(grace=10, kill_timeout=3)
+                self._stop_children(child, netsimd)
+                if child is not None or netsimd is not None:
                     self._wait_ports_free(options)
-                if options.state_mode == "clean":
-                    _remove_private_home(generation, private_home, marker)
+                _remove_private_home(generation, runtime_home, marker)
             except QuarantineError as cleanup_error:
                 raise cleanup_error from failure
             except BaseException as cleanup_error:
@@ -548,6 +580,48 @@ class AndroidBackend:
                 raise
             raise LeaseError(f"Android resource start failed: {failure}") from failure
 
+    @staticmethod
+    def _stop_children(*children: ManagedProcess | None) -> None:
+        failures = []
+        for child in children:
+            if child is not None:
+                try:
+                    child.stop(grace=10, kill_timeout=3)
+                except BaseException as error:
+                    failures.append(error)
+        if failures:
+            failure = QuarantineError("owned Android child cleanup could not be proven")
+            for error in failures:
+                failure.add_note(str(error))
+            raise failure from failures[0]
+
+    @staticmethod
+    def _require_transport_alive(child: ManagedProcess) -> None:
+        status = child.poll()
+        if status is not None:
+            child.wait(timeout=0)
+            raise LeaseError(
+                f"Android netsimd exited with status {status}; bounded log: {child.log_path}"
+            )
+
+    def _wait_transport(
+        self, options: _Options, child: ManagedProcess, deadline: float, cancelled: Event,
+    ) -> None:
+        while True:
+            if cancelled.is_set():
+                raise CommandCancelled("Android transport startup cancelled")
+            self._require_transport_alive(child)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LeaseError("Android netsimd endpoint startup timed out")
+            try:
+                with socket.create_connection(
+                    ("127.0.0.1", options.grpc_port), timeout=min(0.25, remaining),
+                ):
+                    return
+            except OSError:
+                cancelled.wait(min(0.1, max(0, deadline - time.monotonic())))
+
     def _wait_ready(
         self,
         options: _Options,
@@ -555,13 +629,15 @@ class AndroidBackend:
         environment: Mapping[str, str],
         adb_log: Path,
         cancelled: Event,
+        netsimd: ManagedProcess,
+        deadline: float,
     ) -> None:
         serial = f"emulator-{options.console_port}"
-        deadline = time.monotonic() + options.boot_timeout
         last_error = ""
         while True:
             if cancelled.is_set():
                 raise CommandCancelled("Android emulator boot cancelled")
+            self._require_transport_alive(netsimd)
             status = child.poll()
             if status is not None:
                 child.wait(timeout=0)
@@ -600,7 +676,9 @@ class AndroidBackend:
                         cancelled=cancelled,
                         append_log=True,
                     )
-                    if boot.returncode == 0 and boot.output.strip() == "1":
+                    if (boot.returncode == 0 and boot.output.strip() == "1"
+                            and time.monotonic() < deadline):
+                        self._require_transport_alive(netsimd)
                         return
                     last_error = boot.output.strip() or f"boot check exited {boot.returncode}"
                 else:
@@ -646,17 +724,17 @@ class AndroidBackend:
     def _wait_ports_free(self, options: _Options) -> None:
         deadline = time.monotonic() + PORT_RELEASE_TIMEOUT
         while True:
-            if all(_port_bindable(port) for port in (options.console_port, options.adb_port)):
+            if all(_port_bindable(port) for port in options.ports):
                 return
             if time.monotonic() >= deadline:
                 raise QuarantineError(
-                    "Android emulator exited but its console/ADB ports remain occupied"
+                    "Android children exited but their emulator/transport ports remain occupied"
                 )
             time.sleep(PORT_POLL_INTERVAL)
 
 
 class AndroidResource(Resource):
-    """A ready AVD and the live direct child that owns its emulator process."""
+    """A ready AVD with owned emulator and transport direct-child handles."""
 
     def __init__(
         self,
@@ -671,6 +749,7 @@ class AndroidResource(Resource):
         child: ManagedProcess,
         emulator_log: Path,
         adb_log: Path,
+        netsimd: ManagedProcess,
     ):
         self._backend = backend
         self._options = options
@@ -681,6 +760,7 @@ class AndroidResource(Resource):
         self._environment = dict(environment)
         self._avd_name = avd_name
         self._child = child
+        self._netsimd = netsimd
         self._emulator_log = emulator_log
         self._adb_log = adb_log
         self._health_lock = Lock()
@@ -698,7 +778,7 @@ class AndroidResource(Resource):
         return dict(self._endpoint)
 
     def healthy(self) -> bool:
-        if self._stopped or self._child.poll() is not None:
+        if self._stopped or self._child.poll() is not None or self._netsimd.poll() is not None:
             return False
         now = time.monotonic()
         with self._health_lock:
@@ -713,12 +793,11 @@ class AndroidResource(Resource):
     def stop(self) -> None:
         if self._stopped:
             return
-        self._child.stop(grace=10, kill_timeout=3)
+        self._backend._stop_children(self._child, self._netsimd)
         self._backend._wait_ports_free(self._options)
-        if self._persistent_state is None:
-            if self._marker is None:
-                raise QuarantineError("disposable Android generation has no ownership marker")
-            _remove_private_home(self._generation, self._private_home, self._marker)
-        else:
+        if self._persistent_state is not None:
             self._persistent_state.verify_avd()
+        if self._marker is None:
+            raise QuarantineError("disposable Android generation has no ownership marker")
+        _remove_private_home(self._generation, self._private_home, self._marker)
         self._stopped = True

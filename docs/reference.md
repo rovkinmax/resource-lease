@@ -12,8 +12,9 @@ Copy `examples/android.json` to a private configuration file.
 Set absolute paths to your installed SDK and Java home, an already installed
 system image, and unused console/ADB ports. No SDK downloads are performed.
 Each configured slot has capabilities and one image; add slots to configure
-other images or parallel capacity. A slot reserves both its console port and
-the following ADB port.
+other images or parallel capacity. A slot reserves its console port, the
+following ADB port, and transport ports at console+10000 (gRPC) and
+console+20000 (HCI). All four use the existing shared physical-port guards.
 
 From a checkout:
 
@@ -54,6 +55,50 @@ Use exact-serial ADB commands while holding the lease. Complete device work
 before release. Losing the lease means stop using the endpoint immediately.
 The tool does not run, stop, or inspect Gradle, IDE, or arbitrary caller jobs.
 
+## Android launch defaults
+
+The selected SDK must include executable `emulator`, `netsimd`, `adb` and
+`avdmanager` tools. Each lease owns an emulator and one same-SDK netsimd direct
+child. An explicit packet-streamer endpoint connects them without shared
+daemon discovery. Even an image with no active netsim-backed capabilities
+gets its own transport process; the adapter does not duplicate SDK feature
+resolution.
+
+SDK/image defaults select Bluetooth, UWB, NFC, Wi-Fi, graphics, cameras and
+other hardware. The adapter no longer forces radio features or audio off.
+It removes ambient `ANDROID_EMULATOR_FEATURES` and `NETSIM_*` overrides from
+these two child environments so unrelated shell experiments cannot redirect
+the default profile. Ordinary proxy/DNS environment remains inherited.
+It does not change the image or existing AVD hardware configuration.
+
+The default remains headless, with cold boot, no snapshot load/save, and no
+boot animation. Metrics and external crash reporting are disabled for
+noninteractive operation. Explicit memory configuration remains a requested
+resource budget, not a hard limit: the SDK can increase undersized requests.
+The normal audio backend may require host permissions; this tool does not
+grant permissions or dismiss prompts.
+
+The transport has explicit per-slot gRPC/HCI ports and instance, bounded
+stderr logs, no CLI/web control UI or synthetic test beacons. Its startup
+timeout and emulator readiness share the configured boot deadline. Either
+child exiting makes the resource unhealthy. Every teardown attempts to stop
+both owned children before checking all four ports; uncertain teardown
+quarantines the slot rather than granting another owner.
+
+Android preferences stay in the private Android home. Transport temporary
+state is generation-local, including in persistent mode. Real HOME remains
+unchanged. Release removes only marked disposable state after child teardown;
+persistent AVD data is preserved.
+
+This launch policy changes default Wi-Fi transport and restores normal audio;
+removing feature overrides does not imply every image supports every radio.
+Initial qualification targets Emulator37.2.10 / netsimd1.0.23 with API34
+Google APIs arm64 revision14. The candidate's real-device qualification is
+pending; fake-SDK tests alone do not establish Bluetooth/network functionality,
+audio playback, NFC/UWB operation or real persistent-mode compatibility.
+The earlier smoke result in `docs/testing.md` describes the previous launch
+policy, not this candidate.
+
 ## Android state modes
 
 Android slots accept `state_mode: "clean" | "persistent"`. Omitting
@@ -71,10 +116,10 @@ directory and manifest remain; later requests fail closed rather than adopting
 or deleting them. Unknown directories, incompatible image or memory profiles,
 and unexpected state-directory entries are likewise preserved and rejected.
 
-Release and lease expiry stop the owned emulator but preserve persistent AVD
+Release and lease expiry stop both owned children but preserve persistent AVD
 data. Persistent directories are not included in generation diagnostic pruning.
-The physical guard includes the canonical state identity as well as both
-emulator ports, so two pools cannot start the same AVD simultaneously even
+The physical guard includes the canonical state identity as well as all four
+emulator/transport ports, so two pools cannot start the same AVD simultaneously even
 when their configured ports differ. Sequential leases may use different ports.
 A state directory inside a pool's `generations/` tree is rejected.
 
@@ -155,7 +200,7 @@ separate port range.
 ## Failure and recovery boundary
 
 When renewal stops, the healthy service revokes the lease, stops only its own
-emulator using its live child handle, and verifies teardown. A compatible
+emulator and transport using their live child handles, and verifies teardown. A compatible
 waiting caller gets a new disposable AVD in clean mode or the retained AVD in
 persistent mode. A cancellation during boot cannot publish a late endpoint.
 An ordinary start failure is reported only after cleanup; uncertain cleanup

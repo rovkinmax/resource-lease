@@ -46,6 +46,10 @@ def record(tool, args):
         "home": os.environ.get("HOME"),
         "android_user_home": os.environ.get("ANDROID_USER_HOME"),
         "android_avd_home": os.environ.get("ANDROID_AVD_HOME"),
+        "tmpdir": os.environ.get("TMPDIR"),
+        "android_tmp": os.environ.get("ANDROID_TMP"),
+        "feature_override": os.environ.get("ANDROID_EMULATOR_FEATURES"),
+        "netsim_overrides": sorted(key for key in os.environ if key.startswith("NETSIM_")),
     }
     with trace_path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(item, sort_keys=True) + "\n")
@@ -75,26 +79,30 @@ if tool == "avdmanager":
     print(f"Created AVD {name}")
     raise SystemExit(0)
 
-if tool == "emulator":
-    if control().get("emulator") == "exit":
-        print("fixture emulator startup failure", file=sys.stderr)
+if tool in ("emulator", "netsimd"):
+    if control().get(tool) == "exit":
+        print(f"fixture {tool} startup failure", file=sys.stderr)
         raise SystemExit(17)
-    if "-ports" not in args:
-        print("emulator requires explicit console and adb ports", file=sys.stderr)
-        raise SystemExit(64)
-    console_port, adb_port = (int(value) for value in args[args.index("-ports") + 1].split(","))
+    if tool == "emulator":
+        console_port, adb_port = (int(value) for value in args[args.index("-ports") + 1].split(","))
+        ports = (console_port, adb_port)
+    else:
+        console_port = int(args[args.index("--grpc-port") + 1])
+        ports = (console_port, int(args[args.index("--hci-port") + 1]))
+        if control().get("netsimd") == "no-endpoint":
+            ports = ()
     listeners = []
     marker_dir = root / "running"
     marker_dir.mkdir(exist_ok=True)
     marker = marker_dir / str(console_port)
     try:
-        for port in (console_port, adb_port):
+        for port in ports:
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.bind(("127.0.0.1", port))
             listener.listen(1)
             listeners.append(listener)
         marker.write_text(str(os.getpid()), encoding="ascii")
-        (root / "emulator-started").write_text(str(os.getpid()), encoding="ascii")
+        (root / f"{tool}-started").write_text(str(os.getpid()), encoding="ascii")
         active = True
 
         def stop(_signal, _frame):
@@ -111,6 +119,8 @@ if tool == "emulator":
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
         while active:
+            if control().get(tool) == "die":
+                break
             time.sleep(0.02)
     except OSError as error:
         print(f"fixture emulator port failure: {error}", file=sys.stderr)
@@ -196,6 +206,7 @@ def make_fake_android_sdk(root: Path, *, mode: str = "ready") -> FakeAndroidSDK:
     java_home = root / "java"
     avdmanager = sdk_root / "cmdline-tools" / "latest" / "bin" / "avdmanager"
     emulator = sdk_root / "emulator" / "emulator"
+    netsimd = sdk_root / "emulator" / "netsimd"
     adb = sdk_root / "platform-tools" / "adb"
     image = sdk_root / "system-images" / "android-34" / "google_apis" / "arm64-v8a" / "system.img"
     for path in (avdmanager, emulator, adb, java_home / "bin" / "java"):
@@ -213,7 +224,7 @@ def make_fake_android_sdk(root: Path, *, mode: str = "ready") -> FakeAndroidSDK:
         _FAKE_TOOL.replace("__FAKE_ROOT__", repr(str(root))),
         encoding="utf-8",
     )
-    for executable in (avdmanager, emulator, adb):
+    for executable in (avdmanager, emulator, adb, netsimd):
         executable.write_text(
             "#!/usr/bin/env python3\n"
             "import os, pathlib, runpy\n"
@@ -232,12 +243,12 @@ def free_console_port(start: int = 5554) -> int:
     for port in range(start, 5683, 2):
         sockets = []
         try:
-            for candidate in (port, port + 1):
+            for candidate in (port, port + 1, port + 10000, port + 20000):
                 probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sockets.append(probe)
                 probe.bind(("127.0.0.1", candidate))
             if socket.has_ipv6:
-                for candidate in (port, port + 1):
+                for candidate in (port, port + 1, port + 10000, port + 20000):
                     probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
                     sockets.append(probe)
                     probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
@@ -348,16 +359,177 @@ class AndroidBackendTests(unittest.TestCase):
     def assert_private_home_removed(self, generation: Path) -> None:
         self.assertFalse((generation / "android-home").exists())
 
+    def test_default_capabilities_use_owned_transport_without_feature_overrides(self):
+        resource = self.backend.start(self.slot(), self.generation(), Event())
+        self.addCleanup(resource.stop)
+        arguments = self.sdk.calls("emulator")[0]["args"]
+        self.assertNotIn("-feature", arguments)
+        self.assertNotIn("-no-audio", arguments)
+        self.assertIn("-no-boot-anim", arguments)
+        self.assertEqual(len(self.sdk.calls("netsimd")), 1)
+        self.assertEqual(
+            arguments[arguments.index("-packet-streamer-endpoint") + 1],
+            f"127.0.0.1:{self.port + 10000}",
+        )
+
+    def test_transport_environment_and_launch_order(self):
+        with mock.patch.dict(os.environ, {
+            "ANDROID_EMULATOR_FEATURES": "-BluetoothEmulation",
+            "NETSIM_GRPC_PORT": "12345", "NETSIM_INSTANCE": "999",
+        }):
+            resource = self.backend.start(self.slot(), self.generation(), Event())
+        self.addCleanup(resource.stop)
+        calls = [call for call in self.sdk.calls() if call["tool"] != "adb"]
+        self.assertEqual([call["tool"] for call in calls], ["avdmanager", "netsimd", "emulator"])
+        for call in calls[1:3]:
+            self.assertIsNone(call["feature_override"])
+            self.assertEqual(call["netsim_overrides"], [])
+            self.assertEqual(call["tmpdir"], call["android_tmp"])
+            self.assertEqual(
+                Path(call["tmpdir"]), (self.root / "generation/android-home/netsim-tmp").resolve(),
+            )
+        self.assertEqual(calls[0]["feature_override"], "-BluetoothEmulation")
+        self.assertEqual(calls[1]["args"], [
+            "--instance", str(self.port),
+            "--grpc-port", str(self.port + 10000), "--hci-port", str(self.port + 20000),
+            "--logtostderr", "--no-cli-ui", "--no-web-ui", "--no-test-beacons",
+            "--startup-timeout", "5000",
+        ])
+
+    def test_missing_transport_is_rejected_before_any_child_launch(self):
+        (self.sdk.sdk_root / "emulator/netsimd").unlink()
+        with self.assertRaisesRegex(LeaseError, "netsimd"):
+            self.backend.start(self.slot(), self.generation(), Event())
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_foreign_transport_ports_are_not_adopted(self):
+        generation = self.generation()
+        for port in (self.port + 10000, self.port + 20000):
+            with self.subTest(port=port), socket.socket() as listener:
+                listener.bind(("127.0.0.1", port))
+                listener.listen()
+                with self.assertRaisesRegex(LeaseError, "already in use"):
+                    self.backend.start(self.slot(), generation, Event())
+                self.assertNotEqual(listener.fileno(), -1)
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_transport_and_emulator_start_failures_reap_every_child(self):
+        for tool in ("netsimd", "emulator"):
+            with self.subTest(tool=tool):
+                generation = self.root / f"failure-{tool}"
+                generation.mkdir()
+                self.sdk.configure(netsimd="ready", emulator="ready")
+                self.sdk.configure(**{tool: "exit"})
+                with self.assertRaises(LeaseError):
+                    self.backend.start(self.slot(), generation, Event())
+                self.assert_private_home_removed(generation)
+                self.assertTrue(all(android_adapter._port_bindable(port) for port in
+                                    (self.port, self.port + 1, self.port + 10000, self.port + 20000)))
+
+    def test_transport_timeout_prevents_emulator_launch_and_cleans_runtime(self):
+        self.sdk.configure(netsimd="no-endpoint")
+        generation = self.generation()
+        with self.assertRaisesRegex(LeaseError, "netsimd endpoint startup timed out"):
+            self.backend.start(self.slot(boot_timeout=1), generation, Event())
+        self.assertEqual(self.sdk.calls("emulator"), [])
+        self.assert_private_home_removed(generation)
+
+    def test_transport_start_cancellation_reaps_child(self):
+        self.sdk.configure(netsimd="no-endpoint")
+        cancelled = Event()
+        generation = self.generation()
+        original_wait = self.backend._wait_transport
+
+        def cancel(options, child, deadline, event):
+            self.addCleanup(child.stop)
+            event.set()
+            return original_wait(options, child, deadline, event)
+
+        with mock.patch.object(self.backend, "_wait_transport", side_effect=cancel):
+            with self.assertRaisesRegex(LeaseError, "cancelled"):
+                self.backend.start(self.slot(), generation, cancelled)
+        self.assertEqual(self.sdk.calls("emulator"), [])
+        self.assert_private_home_removed(generation)
+
+    def test_boot_uses_the_transport_deadline_without_reset(self):
+        generation = self.generation()
+        original_wait = self.backend._wait_transport
+        deadlines = []
+
+        def wait(options, child, deadline, cancelled):
+            deadlines.append(deadline)
+            return original_wait(options, child, deadline, cancelled)
+
+        original_ready = self.backend._wait_ready
+
+        def ready(*args):
+            self.assertEqual(args[-1], deadlines[0])
+            return original_ready(*args)
+
+        with mock.patch.object(self.backend, "_wait_transport", side_effect=wait), \
+                mock.patch.object(self.backend, "_wait_ready", side_effect=ready):
+            resource = self.backend.start(self.slot(), generation, Event())
+        self.addCleanup(resource.stop)
+
+    def test_transport_death_during_boot_cleans_both_children(self):
+        generation = self.generation()
+        original_ready = self.backend._wait_ready
+
+        def ready(*args):
+            args[-2].stop()
+            return original_ready(*args)
+
+        with mock.patch.object(self.backend, "_wait_ready", side_effect=ready):
+            with self.assertRaisesRegex(LeaseError, "netsimd exited"):
+                self.backend.start(self.slot(), generation, Event())
+        self.assert_private_home_removed(generation)
+
+    def test_transport_death_invalidates_cached_health(self):
+        resource = self.backend.start(self.slot(), self.generation(), Event())
+        self.addCleanup(resource.stop)
+        self.assertTrue(resource.healthy())
+        resource._netsimd.stop()
+        self.assertFalse(resource.healthy())
+
+    def test_failed_emulator_stop_still_stops_transport_and_preserves_runtime(self):
+        generation = self.generation()
+        resource = self.backend.start(self.slot(), generation, Event())
+        self.addCleanup(resource.stop)
+        with mock.patch.object(resource._child, "stop", side_effect=QuarantineError("injected stop")):
+            with self.assertRaises(QuarantineError):
+                resource.stop()
+        self.assertIsNotNone(resource._netsimd.poll())
+        self.assertTrue((generation / "android-home").exists())
+        resource.stop()
+        self.assert_private_home_removed(generation)
+
+    def test_transport_port_remaining_after_children_stop_prevents_cleanup(self):
+        generation = self.generation()
+        resource = self.backend.start(self.slot(), generation, Event())
+        self.addCleanup(resource.stop)
+        resource._netsimd.stop()
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", self.port + 20000))
+            listener.listen()
+            with mock.patch.object(android_adapter, "PORT_RELEASE_TIMEOUT", 0):
+                with self.assertRaisesRegex(QuarantineError, "ports remain occupied"):
+                    resource.stop()
+            self.assertTrue((generation / "android-home").exists())
+        resource.stop()
+        self.assert_private_home_removed(generation)
+
     def test_keys_reserve_both_explicit_ports(self):
         self.assertEqual(
             self.backend.keys(self.slot()),
-            (f"tcp-port:{self.port}", f"tcp-port:{self.port + 1}"),
+            tuple(f"tcp-port:{port}" for port in
+                  (self.port, self.port + 1, self.port + 10000, self.port + 20000)),
         )
 
     def test_persistent_mode_uses_canonical_state_guard_without_creating_state(self):
         self.assertEqual(
             self.backend.keys(self.slot()),
-            (f"tcp-port:{self.port}", f"tcp-port:{self.port + 1}"),
+            tuple(f"tcp-port:{port}" for port in
+                  (self.port, self.port + 1, self.port + 10000, self.port + 20000)),
         )
         parent = self.root / "persistent-parent"
         parent.mkdir(mode=0o700)
@@ -641,6 +813,12 @@ class AndroidBackendTests(unittest.TestCase):
         generation = self.generation()
         captured: list[ManagedProcess] = []
         original_stop = ManagedProcess.stop
+        original_launch = android_adapter.launch_child
+
+        def track_launch(*args, **kwargs):
+            child = original_launch(*args, **kwargs)
+            self.addCleanup(lambda: original_stop(child))
+            return child
 
         def quarantine_after_spawn(*args):
             child = args[1]
@@ -656,7 +834,7 @@ class AndroidBackendTests(unittest.TestCase):
         with mock.patch.object(
             ManagedProcess, "stop",
             side_effect=QuarantineError("injected child-stop uncertainty"),
-        ):
+        ), mock.patch.object(android_adapter, "launch_child", side_effect=track_launch):
             with mock.patch.object(
                 self.backend, "_wait_ready", side_effect=quarantine_after_spawn,
             ):
@@ -718,12 +896,12 @@ class AndroidBackendTests(unittest.TestCase):
             f"{self.port},{self.port + 1}",
         )
         for flag in (
-            "-no-window", "-no-snapshot", "-no-audio", "-no-boot-anim",
-            "-no-metrics", "-crash-report-mode", "-feature",
+            "-no-window", "-no-snapshot", "-no-boot-anim",
+            "-no-metrics", "-crash-report-mode",
         ):
             self.assertIn(flag, emulator_args)
-        for feature in ("-BluetoothEmulation", "-Uwb", "-Nfc", "-WiFiPacketStream"):
-            self.assertIn(feature, emulator_args)
+        self.assertNotIn("-feature", emulator_args)
+        self.assertNotIn("-no-audio", emulator_args)
 
         adb_calls = self.sdk.calls("adb")
         self.assertTrue(adb_calls)
@@ -734,7 +912,7 @@ class AndroidBackendTests(unittest.TestCase):
         self.assert_private_home_removed(generation)
         self.assertEqual(
             {path.name for path in generation.iterdir()},
-            {"android-avdmanager.log", "android-emulator.log", "android-adb.log"},
+            {"android-avdmanager.log", "android-emulator.log", "android-adb.log", "android-netsimd.log"},
         )
         for log in generation.iterdir():
             self.assertLessEqual(log.stat().st_size, MAX_LOG_BYTES)

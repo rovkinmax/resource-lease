@@ -16,7 +16,9 @@ from unittest import mock
 from resourcelease.backends import android as android_adapter
 from resourcelease.backends.android import AndroidBackend
 from resourcelease.model import Config, LeaseError, QuarantineError, Slot
-from resourcelease.process import CommandTimeout, ManagedProcess, launch_child, run_command
+from resourcelease.process import (
+    CommandResult, CommandTimeout, ManagedProcess, launch_child, run_command,
+)
 from resourcelease.store import Store
 
 
@@ -466,14 +468,38 @@ class AndroidBackendTests(unittest.TestCase):
         self.assertTrue(resource.healthy())
         self.assertEqual((self.sdk.root / "readiness-checks").read_text(), checks)
 
-    def test_hung_storage_probe_uses_boot_deadline_and_cleans_children(self):
-        self.sdk.configure(readiness="hang")
-        generation = self.generation()
-        with self.assertRaisesRegex(LeaseError, "did not boot within 1s"):
-            self.backend.start(self.slot(boot_timeout=1), generation, Event())
-        self.assertTrue((self.sdk.root / "readiness-started").exists())
-        self.assert_private_home_removed(generation)
-        self.assertEqual(list((self.sdk.root / "running").iterdir()), [])
+    def test_storage_probe_timeout_exhausts_original_boot_deadline(self):
+        options = android_adapter._parse_options(self.slot(boot_timeout=1))
+        child = mock.Mock()
+        child.poll.return_value = None
+        transport = mock.Mock()
+        transport.poll.return_value = None
+        log = self.root / "adb.log"
+        now = [0.0]
+        clock = mock.Mock(wraps=time)
+        clock.monotonic.side_effect = lambda: now[0]
+        timeouts = []
+
+        def observe(arguments, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            if arguments[3:] == ["get-state"]:
+                now[0] = 0.25
+                return CommandResult(0, "device", log)
+            if arguments[3:] == ["shell", "getprop", "sys.boot_completed"]:
+                now[0] = 0.5
+                return CommandResult(0, "1", log)
+            self.assertEqual(arguments[3:6], ["shell", "sh", "-c"])
+            now[0] = 1.0
+            raise CommandTimeout("injected storage command timeout")
+
+        # Advance the adapter clock at each command boundary. Slow fake-SDK
+        # interpreter startup must not consume the budget before this test's
+        # storage phase; real command reaping and startup cleanup are tested separately.
+        with mock.patch.object(android_adapter, "time", clock):
+            with mock.patch.object(android_adapter, "run_command", side_effect=observe):
+                with self.assertRaisesRegex(LeaseError, "did not boot within 1s"):
+                    self.backend._wait_ready(options, child, {}, log, Event(), transport, 1.0)
+        self.assertEqual(timeouts, [1.0, 0.75, 0.5])
 
     def test_storage_probe_cancellation_preserves_persistent_initialization_and_reuse(self):
         for mode in ("clean", "persistent-new", "persistent-reused"):
@@ -923,8 +949,10 @@ class AndroidBackendTests(unittest.TestCase):
 
     def test_foreign_generation_rejection_preserves_existing_state_and_resolves_aliases(self):
         pool = self.root / "other-pool"
+        pool.mkdir(mode=0o700)
+        (pool / "generations").mkdir(mode=0o700)
         generation = pool / "generations" / "completed-request"
-        generation.mkdir(parents=True, mode=0o700)
+        generation.mkdir(mode=0o700)
         # Even a damaged database must not make a pool's disposable tree safe.
         (pool / "leases.sqlite3").write_bytes(b"damaged database")
         state = generation / "persistent-state"

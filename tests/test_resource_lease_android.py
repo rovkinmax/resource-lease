@@ -15,8 +15,11 @@ from unittest import mock
 
 from resourcelease.backends import android as android_adapter
 from resourcelease.backends.android import AndroidBackend
-from resourcelease.model import LeaseError, QuarantineError, Slot
-from resourcelease.process import CommandTimeout, ManagedProcess, launch_child, run_command
+from resourcelease.model import Config, LeaseError, QuarantineError, Slot
+from resourcelease.process import (
+    CommandResult, CommandTimeout, ManagedProcess, launch_child, run_command,
+)
+from resourcelease.store import Store
 
 
 SYSTEM_IMAGE = "system-images;android-34;google_apis;arm64-v8a"
@@ -46,6 +49,10 @@ def record(tool, args):
         "home": os.environ.get("HOME"),
         "android_user_home": os.environ.get("ANDROID_USER_HOME"),
         "android_avd_home": os.environ.get("ANDROID_AVD_HOME"),
+        "tmpdir": os.environ.get("TMPDIR"),
+        "android_tmp": os.environ.get("ANDROID_TMP"),
+        "feature_override": os.environ.get("ANDROID_EMULATOR_FEATURES"),
+        "netsim_overrides": sorted(key for key in os.environ if key.startswith("NETSIM_")),
     }
     with trace_path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(item, sort_keys=True) + "\n")
@@ -75,26 +82,30 @@ if tool == "avdmanager":
     print(f"Created AVD {name}")
     raise SystemExit(0)
 
-if tool == "emulator":
-    if control().get("emulator") == "exit":
-        print("fixture emulator startup failure", file=sys.stderr)
+if tool in ("emulator", "netsimd"):
+    if control().get(tool) == "exit":
+        print(f"fixture {tool} startup failure", file=sys.stderr)
         raise SystemExit(17)
-    if "-ports" not in args:
-        print("emulator requires explicit console and adb ports", file=sys.stderr)
-        raise SystemExit(64)
-    console_port, adb_port = (int(value) for value in args[args.index("-ports") + 1].split(","))
+    if tool == "emulator":
+        console_port, adb_port = (int(value) for value in args[args.index("-ports") + 1].split(","))
+        ports = (console_port, adb_port)
+    else:
+        console_port = int(args[args.index("--grpc-port") + 1])
+        ports = (console_port, int(args[args.index("--hci-port") + 1]))
+        if control().get("netsimd") == "no-endpoint":
+            ports = ()
     listeners = []
     marker_dir = root / "running"
     marker_dir.mkdir(exist_ok=True)
     marker = marker_dir / str(console_port)
     try:
-        for port in (console_port, adb_port):
+        for port in ports:
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.bind(("127.0.0.1", port))
             listener.listen(1)
             listeners.append(listener)
         marker.write_text(str(os.getpid()), encoding="ascii")
-        (root / "emulator-started").write_text(str(os.getpid()), encoding="ascii")
+        (root / f"{tool}-started").write_text(str(os.getpid()), encoding="ascii")
         active = True
 
         def stop(_signal, _frame):
@@ -111,6 +122,16 @@ if tool == "emulator":
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
         while active:
+            if control().get(tool) == "die":
+                break
+            if (tool == "netsimd" and control().get("netsimd") == "no-clients"
+                    and (root / "trigger-netsim-timeout").exists()):
+                retained = "--no-shutdown" in args
+                (root / "netsim-timeout-result").write_text(
+                    "retained" if retained else "expired", encoding="ascii",
+                )
+                if not retained:
+                    break
             time.sleep(0.02)
     except OSError as error:
         print(f"fixture emulator port failure: {error}", file=sys.stderr)
@@ -144,6 +165,28 @@ if tool == "adb":
     if args[2:] == ["shell", "getprop", "sys.boot_completed"]:
         print("1" if running and control().get("boot_completed", True) else "0")
         raise SystemExit(0 if running else 1)
+    if args[2:5] == ["shell", "sh", "-c"] and args[-4] == "resource-lease-ready":
+        settings = control()
+        (root / "readiness-started").touch()
+        if settings.get("readiness") == "hang":
+            while True:
+                time.sleep(0.02)
+        counter = root / "readiness-checks"
+        checks = int(counter.read_text()) + 1 if counter.exists() else 1
+        counter.write_text(str(checks))
+        if not settings.get("package_manager", True):
+            print("Package Manager not ready")
+            raise SystemExit(1)
+        if not settings.get("storage_mounted", True) or checks <= settings.get("storage_delay", 0):
+            print("Primary storage not mounted")
+            raise SystemExit(1)
+        if args[-2] == "1" and not settings.get("download_ready", True):
+            print("Download not ready")
+            raise SystemExit(1)
+        if not settings.get("storage_io", True):
+            print("Storage write/read/delete probe failed")
+            raise SystemExit(1)
+        raise SystemExit(0)
     print("unsupported fake adb command", file=sys.stderr)
     raise SystemExit(64)
 
@@ -196,12 +239,16 @@ def make_fake_android_sdk(root: Path, *, mode: str = "ready") -> FakeAndroidSDK:
     java_home = root / "java"
     avdmanager = sdk_root / "cmdline-tools" / "latest" / "bin" / "avdmanager"
     emulator = sdk_root / "emulator" / "emulator"
+    netsimd = sdk_root / "emulator" / "netsimd"
     adb = sdk_root / "platform-tools" / "adb"
     image = sdk_root / "system-images" / "android-34" / "google_apis" / "arm64-v8a" / "system.img"
     for path in (avdmanager, emulator, adb, java_home / "bin" / "java"):
         path.parent.mkdir(parents=True, exist_ok=True)
     image.parent.mkdir(parents=True, exist_ok=True)
     image.write_bytes(b"deterministic fake installed system image")
+    (image.parent / "source.properties").write_text(
+        "Pkg.Revision=1.0.0\n", encoding="utf-8",
+    )
     control_path = root / "control.json"
     control_path.write_text(json.dumps({"mode": mode}), encoding="utf-8")
     trace_path = root / "calls.jsonl"
@@ -210,7 +257,7 @@ def make_fake_android_sdk(root: Path, *, mode: str = "ready") -> FakeAndroidSDK:
         _FAKE_TOOL.replace("__FAKE_ROOT__", repr(str(root))),
         encoding="utf-8",
     )
-    for executable in (avdmanager, emulator, adb):
+    for executable in (avdmanager, emulator, adb, netsimd):
         executable.write_text(
             "#!/usr/bin/env python3\n"
             "import os, pathlib, runpy\n"
@@ -225,16 +272,16 @@ def make_fake_android_sdk(root: Path, *, mode: str = "ready") -> FakeAndroidSDK:
     return FakeAndroidSDK(root, sdk_root, java_home, control_path, trace_path)
 
 
-def free_console_port() -> int:
-    for port in range(5554, 5683, 2):
+def free_console_port(start: int = 5554) -> int:
+    for port in range(start, 5683, 2):
         sockets = []
         try:
-            for candidate in (port, port + 1):
+            for candidate in (port, port + 1, port + 10000, port + 20000):
                 probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sockets.append(probe)
                 probe.bind(("127.0.0.1", candidate))
             if socket.has_ipv6:
-                for candidate in (port, port + 1):
+                for candidate in (port, port + 1, port + 10000, port + 20000):
                     probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
                     sockets.append(probe)
                     probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
@@ -323,6 +370,20 @@ class AndroidBackendTests(unittest.TestCase):
         options = self.sdk.options(port or self.port, **overrides)
         return Slot("android-test", ("android-api-34",), "android", options)
 
+    def persistent_slot(
+        self,
+        state_directory: Path,
+        *,
+        port: int | None = None,
+        **overrides,
+    ) -> Slot:
+        options = self.sdk.options(port or self.port, **overrides)
+        options.update(
+            state_mode="persistent",
+            state_directory=str(state_directory),
+        )
+        return Slot("android-test", ("android-api-34",), "android", options)
+
     def generation(self) -> Path:
         generation = self.root / "generation"
         generation.mkdir(mode=0o700)
@@ -331,11 +392,669 @@ class AndroidBackendTests(unittest.TestCase):
     def assert_private_home_removed(self, generation: Path) -> None:
         self.assertFalse((generation / "android-home").exists())
 
+    def test_default_capabilities_use_owned_transport_without_feature_overrides(self):
+        resource = self.backend.start(self.slot(), self.generation(), Event())
+        self.addCleanup(resource.stop)
+        arguments = self.sdk.calls("emulator")[0]["args"]
+        self.assertNotIn("-feature", arguments)
+        self.assertNotIn("-no-audio", arguments)
+        self.assertIn("-no-boot-anim", arguments)
+        self.assertEqual(len(self.sdk.calls("netsimd")), 1)
+        self.assertEqual(
+            arguments[arguments.index("-packet-streamer-endpoint") + 1],
+            f"127.0.0.1:{self.port + 10000}",
+        )
+
+    def test_boot_complete_does_not_publish_unready_storage(self):
+        for index, settings in enumerate((
+            {"package_manager": False},
+            {"storage_mounted": False},
+            {"download_ready": False},
+            {"storage_io": False},
+        )):
+            with self.subTest(settings=settings):
+                self.sdk.configure(
+                    package_manager=True, storage_mounted=True,
+                    download_ready=True, storage_io=True,
+                )
+                self.sdk.configure(**settings)
+                generation = self.root / f"unready-{index}"
+                generation.mkdir(mode=0o700)
+                resource = None
+                try:
+                    with self.assertRaisesRegex(LeaseError, "boot|ready"):
+                        resource = self.backend.start(
+                            self.slot(boot_timeout=1), generation, Event(),
+                        )
+                        self.addCleanup(resource.stop)
+                finally:
+                    if resource is not None:
+                        resource.stop()
+                self.assert_private_home_removed(generation)
+
+    def test_start_waits_for_storage_without_an_additional_deadline(self):
+        self.sdk.configure(storage_delay=2)
+        resource = self.backend.start(self.slot(), self.generation(), Event())
+        self.addCleanup(resource.stop)
+        self.assertEqual((self.sdk.root / "readiness-checks").read_text(), "3")
+        checks = [
+            call for call in self.sdk.calls("adb")
+            if call["args"][2:5] == ["shell", "sh", "-c"]
+        ]
+        self.assertEqual(len(checks), 3)
+        self.assertEqual({call["args"][1] for call in checks}, {f"emulator-{self.port}"})
+        self.assertEqual({call["args"][-2] for call in checks}, {"1"})
+        self.assertEqual(len({call["args"][-1] for call in checks}), 1)
+
+    def test_persistent_acquisition_does_not_require_download(self):
+        self.sdk.configure(download_ready=False)
+        resource = self.backend.start(
+            self.persistent_slot(self.root / "persistent-state"),
+            self.generation(), Event(),
+        )
+        self.addCleanup(resource.stop)
+        checks = [
+            call for call in self.sdk.calls("adb")
+            if call["args"][2:5] == ["shell", "sh", "-c"]
+        ]
+        self.assertTrue(checks, "Acquisition must check storage even in persistent mode")
+        self.assertEqual({call["args"][-2] for call in checks}, {"0"})
+
+    def test_download_is_not_an_ongoing_health_requirement(self):
+        resource = self.backend.start(self.slot(), self.generation(), Event())
+        self.addCleanup(resource.stop)
+        checks = (self.sdk.root / "readiness-checks").read_text()
+        self.sdk.configure(download_ready=False, storage_io=False)
+        self.assertTrue(resource.healthy())
+        self.assertEqual((self.sdk.root / "readiness-checks").read_text(), checks)
+
+    def test_storage_probe_timeout_exhausts_original_boot_deadline(self):
+        options = android_adapter._parse_options(self.slot(boot_timeout=1))
+        child = mock.Mock()
+        child.poll.return_value = None
+        transport = mock.Mock()
+        transport.poll.return_value = None
+        log = self.root / "adb.log"
+        now = [0.0]
+        clock = mock.Mock(wraps=time)
+        clock.monotonic.side_effect = lambda: now[0]
+        timeouts = []
+
+        def observe(arguments, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            if arguments[3:] == ["get-state"]:
+                now[0] = 0.25
+                return CommandResult(0, "device", log)
+            if arguments[3:] == ["shell", "getprop", "sys.boot_completed"]:
+                now[0] = 0.5
+                return CommandResult(0, "1", log)
+            self.assertEqual(arguments[3:6], ["shell", "sh", "-c"])
+            now[0] = 1.0
+            raise CommandTimeout("injected storage command timeout")
+
+        # Advance the adapter clock at each command boundary. Slow fake-SDK
+        # interpreter startup must not consume the budget before this test's
+        # storage phase; real command reaping and startup cleanup are tested separately.
+        with mock.patch.object(android_adapter, "time", clock):
+            with mock.patch.object(android_adapter, "run_command", side_effect=observe):
+                with self.assertRaisesRegex(LeaseError, "did not boot within 1s"):
+                    self.backend._wait_ready(options, child, {}, log, Event(), transport, 1.0)
+        self.assertEqual(timeouts, [1.0, 0.75, 0.5])
+
+    def test_storage_probe_cancellation_preserves_persistent_initialization_and_reuse(self):
+        for mode in ("clean", "persistent-new", "persistent-reused"):
+            with self.subTest(mode=mode):
+                self.sdk.configure(readiness="ready")
+                state = self.root / mode
+                slot = (
+                    self.slot(boot_timeout=10) if mode == "clean"
+                    else self.persistent_slot(state, boot_timeout=10)
+                )
+                manifest = state / ".resource-lease-android-state.json"
+                manifest_before = None
+                sentinel = None
+                if mode == "persistent-reused":
+                    initial = self.root / "initial-generation"
+                    initial.mkdir(mode=0o700)
+                    resource = self.backend.start(slot, initial, Event())
+                    self.addCleanup(resource.stop)
+                    call = self.sdk.calls("avdmanager")[-1]["args"]
+                    sentinel = Path(call[call.index("-p") + 1]) / "userdata-qemu.img"
+                    sentinel.write_bytes(b"keep persistent data")
+                    resource.stop()
+                    manifest_before = manifest.read_bytes()
+                marker = self.sdk.root / "readiness-started"
+                marker.unlink(missing_ok=True)
+                self.sdk.configure(readiness="hang")
+                cancelled = Event()
+
+                def cancel_during_probe():
+                    deadline = time.monotonic() + 5
+                    while not marker.exists() and time.monotonic() < deadline:
+                        if cancelled.wait(0.01):
+                            return
+                    cancelled.set()
+
+                thread = Thread(target=cancel_during_probe)
+                thread.start()
+                self.addCleanup(thread.join, 5)
+                self.addCleanup(cancelled.set)
+                generation = self.root / f"{mode}-generation"
+                generation.mkdir(mode=0o700)
+                try:
+                    with self.assertRaisesRegex(LeaseError, "cancelled"):
+                        self.backend.start(slot, generation, cancelled)
+                finally:
+                    cancelled.set()
+                    thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+                self.assertTrue(marker.exists())
+                self.assert_private_home_removed(generation)
+                self.assertEqual(list((self.sdk.root / "running").iterdir()), [])
+                if mode == "persistent-new":
+                    self.assertEqual(json.loads(manifest.read_text())["status"], "initializing")
+                elif mode == "persistent-reused":
+                    self.assertEqual(manifest.read_bytes(), manifest_before)
+                    self.assertEqual(sentinel.read_bytes(), b"keep persistent data")
+
+    def test_transport_environment_and_launch_order(self):
+        with mock.patch.dict(os.environ, {
+            "ANDROID_EMULATOR_FEATURES": "-BluetoothEmulation",
+            "NETSIM_GRPC_PORT": "12345", "NETSIM_INSTANCE": "999",
+        }):
+            resource = self.backend.start(self.slot(), self.generation(), Event())
+        self.addCleanup(resource.stop)
+        calls = [call for call in self.sdk.calls() if call["tool"] != "adb"]
+        self.assertEqual([call["tool"] for call in calls], ["avdmanager", "netsimd", "emulator"])
+        for call in calls[1:3]:
+            self.assertIsNone(call["feature_override"])
+            self.assertEqual(call["netsim_overrides"], [])
+            self.assertEqual(call["tmpdir"], call["android_tmp"])
+            self.assertEqual(
+                Path(call["tmpdir"]), (self.root / "generation/android-home/netsim-tmp").resolve(),
+            )
+        self.assertEqual(calls[0]["feature_override"], "-BluetoothEmulation")
+        self.assertEqual(calls[1]["args"], [
+            "--instance", str(self.port),
+            "--grpc-port", str(self.port + 10000), "--hci-port", str(self.port + 20000),
+            "--logtostderr", "--no-cli-ui", "--no-web-ui", "--no-test-beacons",
+            "--no-shutdown",
+        ])
+
+    def test_missing_transport_is_rejected_before_any_child_launch(self):
+        (self.sdk.sdk_root / "emulator/netsimd").unlink()
+        with self.assertRaisesRegex(LeaseError, "netsimd"):
+            self.backend.start(self.slot(), self.generation(), Event())
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_foreign_transport_ports_are_not_adopted(self):
+        generation = self.generation()
+        for port in (self.port + 10000, self.port + 20000):
+            with self.subTest(port=port), socket.socket() as listener:
+                listener.bind(("127.0.0.1", port))
+                listener.listen()
+                with self.assertRaisesRegex(LeaseError, "already in use"):
+                    self.backend.start(self.slot(), generation, Event())
+                self.assertNotEqual(listener.fileno(), -1)
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_transport_and_emulator_start_failures_reap_every_child(self):
+        for tool in ("netsimd", "emulator"):
+            with self.subTest(tool=tool):
+                generation = self.root / f"failure-{tool}"
+                generation.mkdir()
+                self.sdk.configure(netsimd="ready", emulator="ready")
+                self.sdk.configure(**{tool: "exit"})
+                with self.assertRaises(LeaseError):
+                    self.backend.start(self.slot(), generation, Event())
+                self.assert_private_home_removed(generation)
+                self.assertTrue(all(android_adapter._port_bindable(port) for port in
+                                    (self.port, self.port + 1, self.port + 10000, self.port + 20000)))
+
+    def test_transport_timeout_prevents_emulator_launch_and_cleans_runtime(self):
+        self.sdk.configure(netsimd="no-endpoint")
+        generation = self.generation()
+        with self.assertRaisesRegex(LeaseError, "netsimd endpoint startup timed out"):
+            self.backend.start(self.slot(boot_timeout=1), generation, Event())
+        self.assertEqual(self.sdk.calls("emulator"), [])
+        self.assert_private_home_removed(generation)
+
+    def test_transport_start_cancellation_reaps_child(self):
+        self.sdk.configure(netsimd="no-endpoint")
+        cancelled = Event()
+        generation = self.generation()
+        original_wait = self.backend._wait_transport
+
+        def cancel(options, child, deadline, event):
+            self.addCleanup(child.stop)
+            event.set()
+            return original_wait(options, child, deadline, event)
+
+        with mock.patch.object(self.backend, "_wait_transport", side_effect=cancel):
+            with self.assertRaisesRegex(LeaseError, "cancelled"):
+                self.backend.start(self.slot(), generation, cancelled)
+        self.assertEqual(self.sdk.calls("emulator"), [])
+        self.assert_private_home_removed(generation)
+
+    def test_boot_uses_the_transport_deadline_without_reset(self):
+        generation = self.generation()
+        original_wait = self.backend._wait_transport
+        deadlines = []
+
+        def wait(options, child, deadline, cancelled):
+            deadlines.append(deadline)
+            return original_wait(options, child, deadline, cancelled)
+
+        original_ready = self.backend._wait_ready
+
+        def ready(*args):
+            self.assertEqual(args[-1], deadlines[0])
+            return original_ready(*args)
+
+        with mock.patch.object(self.backend, "_wait_transport", side_effect=wait), \
+                mock.patch.object(self.backend, "_wait_ready", side_effect=ready):
+            resource = self.backend.start(self.slot(), generation, Event())
+        self.addCleanup(resource.stop)
+
+    def test_transport_death_during_boot_cleans_both_children(self):
+        generation = self.generation()
+        original_ready = self.backend._wait_ready
+
+        def ready(*args):
+            args[-2].stop()
+            return original_ready(*args)
+
+        with mock.patch.object(self.backend, "_wait_ready", side_effect=ready):
+            with self.assertRaisesRegex(LeaseError, "netsimd exited"):
+                self.backend.start(self.slot(), generation, Event())
+        self.assert_private_home_removed(generation)
+
+    def test_transport_death_invalidates_cached_health(self):
+        resource = self.backend.start(self.slot(), self.generation(), Event())
+        self.addCleanup(resource.stop)
+        self.assertTrue(resource.healthy())
+        resource._netsimd.stop()
+        self.assertFalse(resource.healthy())
+
+    def test_unused_transport_lifetime_is_owned_by_lease_not_sdk_timer(self):
+        self.sdk.configure(netsimd="no-clients")
+        generation = self.generation()
+        resource = self.backend.start(self.slot(), generation, Event())
+        self.addCleanup(resource.stop)
+        (self.sdk.root / "trigger-netsim-timeout").write_text("expire", encoding="ascii")
+        result = self.sdk.root / "netsim-timeout-result"
+        deadline = time.monotonic() + 3
+        while not result.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(result.exists(), "Fake SDK did not observe its timeout")
+        self.assertEqual(result.read_text(encoding="ascii"), "retained")
+        self.assertTrue(resource.healthy())
+        resource.stop()
+        self.assertIsNotNone(resource._netsimd.poll())
+        self.assertIsNotNone(resource._child.poll())
+        self.assert_private_home_removed(generation)
+
+    def test_failed_emulator_stop_still_stops_transport_and_preserves_runtime(self):
+        generation = self.generation()
+        resource = self.backend.start(self.slot(), generation, Event())
+        self.addCleanup(resource.stop)
+        with mock.patch.object(resource._child, "stop", side_effect=QuarantineError("injected stop")):
+            with self.assertRaises(QuarantineError):
+                resource.stop()
+        self.assertIsNotNone(resource._netsimd.poll())
+        self.assertTrue((generation / "android-home").exists())
+        resource.stop()
+        self.assert_private_home_removed(generation)
+
+    def test_transport_port_remaining_after_children_stop_prevents_cleanup(self):
+        generation = self.generation()
+        resource = self.backend.start(self.slot(), generation, Event())
+        self.addCleanup(resource.stop)
+        resource._netsimd.stop()
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", self.port + 20000))
+            listener.listen()
+            with mock.patch.object(android_adapter, "PORT_RELEASE_TIMEOUT", 0):
+                with self.assertRaisesRegex(QuarantineError, "ports remain occupied"):
+                    resource.stop()
+            self.assertTrue((generation / "android-home").exists())
+        resource.stop()
+        self.assert_private_home_removed(generation)
+
     def test_keys_reserve_both_explicit_ports(self):
         self.assertEqual(
             self.backend.keys(self.slot()),
-            (f"tcp-port:{self.port}", f"tcp-port:{self.port + 1}"),
+            tuple(f"tcp-port:{port}" for port in
+                  (self.port, self.port + 1, self.port + 10000, self.port + 20000)),
         )
+
+    def test_persistent_mode_uses_canonical_state_guard_without_creating_state(self):
+        self.assertEqual(
+            self.backend.keys(self.slot()),
+            tuple(f"tcp-port:{port}" for port in
+                  (self.port, self.port + 1, self.port + 10000, self.port + 20000)),
+        )
+        parent = self.root / "persistent-parent"
+        parent.mkdir(mode=0o700)
+        state_directory = parent / "android-state"
+        options = self.sdk.options(self.port)
+        options.update(state_mode="persistent", state_directory=str(state_directory))
+        slot = Slot("android-persistent", ("android-api-34",), "android", options)
+
+        keys = self.backend.keys(slot)
+        state_keys = tuple(key for key in keys if key.startswith("android-state:"))
+        self.assertEqual(len(state_keys), 1)
+        self.assertFalse(state_directory.exists(), "key discovery must not create persistent state")
+
+        alias = self.root / "persistent-parent-alias"
+        alias.symlink_to(parent, target_is_directory=True)
+        alias_options = self.sdk.options(self.port)
+        alias_options.update(
+            state_mode="persistent",
+            state_directory=str(alias / "android-state"),
+        )
+        alias_slot = Slot("android-persistent-alias", ("android-api-34",), "android",
+                          alias_options)
+        alias_keys = self.backend.keys(alias_slot)
+        self.assertEqual(
+            state_keys,
+            tuple(key for key in alias_keys if key.startswith("android-state:")),
+            "different path spellings must guard one canonical AVD state",
+        )
+
+    def test_persistent_mode_configuration_is_explicit_and_closed(self):
+        options = self.sdk.options(self.port)
+        options["state_mode"] = "persistent"
+        with self.assertRaisesRegex(LeaseError, "state_directory"):
+            self.backend.keys(Slot("android-test", ("test",), "android", options))
+
+        options["state_directory"] = str(self.root / "persistent")
+        options["state_mode"] = "other"
+        with self.assertRaisesRegex(LeaseError, "state_mode"):
+            self.backend.keys(Slot("android-test", ("test",), "android", options))
+
+        options["state_mode"] = "clean"
+        with self.assertRaisesRegex(LeaseError, "only valid"):
+            self.backend.keys(Slot("android-test", ("test",), "android", options))
+
+    def test_persistent_avd_is_reused_and_survives_release(self):
+        state_directory = self.root / "persistent-state"
+        first_generation = self.generation()
+        first = self.backend.start(
+            self.persistent_slot(state_directory), first_generation, Event(),
+        )
+        self.addCleanup(first.stop)
+        avd_call = self.sdk.calls("avdmanager")[0]
+        avd_args = avd_call["args"]
+        avd_name = avd_args[avd_args.index("-n") + 1]
+        avd_path = Path(avd_args[avd_args.index("-p") + 1])
+        marker = avd_path / "userdata-qemu.img"
+        marker.write_bytes(b"persistent fake user data")
+
+        manifest_path = state_directory / ".resource-lease-android-state.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["owner"], "resource-lease")
+        self.assertEqual(manifest["status"], "complete")
+        self.assertEqual(manifest["profile"]["system_image"], SYSTEM_IMAGE)
+        self.assertEqual(manifest["profile"]["memory_mb"], 2048)
+        self.assertTrue(state_directory.is_dir())
+        self.assertFalse(state_directory.is_relative_to(first_generation))
+
+        first.stop()
+        self.assertTrue(marker.exists(), "release deleted persistent AVD data")
+        self.assertFalse((first_generation / "android-home").exists())
+
+        second_generation = self.root / "generation-two"
+        second_generation.mkdir(mode=0o700)
+        second = self.backend.start(
+            self.persistent_slot(state_directory), second_generation, Event(),
+        )
+        self.addCleanup(second.stop)
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+        emulator_calls = self.sdk.calls("emulator")
+        self.assertEqual(len(emulator_calls), 2)
+        second_args = emulator_calls[1]["args"]
+        self.assertEqual(second_args[second_args.index("-avd") + 1], avd_name)
+        self.assertEqual(marker.read_bytes(), b"persistent fake user data")
+        second.stop()
+        self.assertTrue(marker.exists(), "later release deleted persistent AVD data")
+
+    def test_unknown_persistent_directory_is_never_adopted_or_deleted(self):
+        state_directory = self.root / "unmarked-state"
+        state_directory.mkdir(mode=0o700)
+        sentinel = state_directory / "operator-data"
+        sentinel.write_text("not owned by this backend", encoding="utf-8")
+
+        with self.assertRaisesRegex(LeaseError, "persistent Android manifest"):
+            self.backend.start(
+                self.persistent_slot(state_directory), self.generation(), Event(),
+            )
+        self.assertTrue(sentinel.exists())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "not owned by this backend")
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_partial_persistent_initialization_is_retained_and_not_retried(self):
+        state_directory = self.root / "partial-state"
+        slot = self.persistent_slot(state_directory)
+        self.sdk.configure(avdmanager="create-fail")
+        with self.assertRaisesRegex(LeaseError, "fixture avdmanager failure"):
+            self.backend.start(slot, self.generation(), Event())
+
+        manifest_path = state_directory / ".resource-lease-android-state.json"
+        manifest_before = manifest_path.read_bytes()
+        self.assertEqual(json.loads(manifest_before)["status"], "initializing")
+        avd_files_before = sorted(
+            path.relative_to(state_directory).as_posix()
+            for path in state_directory.rglob("*")
+        )
+        self.assertTrue(any(path.endswith("config.ini") for path in avd_files_before))
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+
+        second_generation = self.root / "generation-two"
+        second_generation.mkdir(mode=0o700)
+        with self.assertRaisesRegex(LeaseError, "initialization is incomplete"):
+            self.backend.start(slot, second_generation, Event())
+        self.assertEqual(manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(
+            sorted(path.relative_to(state_directory).as_posix()
+                   for path in state_directory.rglob("*")),
+            avd_files_before,
+        )
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+
+    def test_incompatible_persistent_image_and_memory_profiles_are_preserved(self):
+        state_directory = self.root / "incompatible-state"
+        first = self.backend.start(
+            self.persistent_slot(state_directory), self.generation(), Event(),
+        )
+        self.addCleanup(first.stop)
+        avd_path = Path(self.sdk.calls("avdmanager")[0]["args"][-1])
+        marker = avd_path / "userdata-qemu.img"
+        marker.write_bytes(b"must survive profile mismatch")
+        first.stop()
+        manifest_path = state_directory / ".resource-lease-android-state.json"
+        manifest_before = manifest_path.read_bytes()
+
+        properties = (
+            self.sdk.sdk_root / "system-images" / "android-34" / "google_apis"
+            / "arm64-v8a" / "source.properties"
+        )
+        properties.write_text("Pkg.Revision=2.0.0\n", encoding="utf-8")
+        generation_two = self.root / "generation-two"
+        generation_two.mkdir(mode=0o700)
+        with self.assertRaisesRegex(LeaseError, "profile differs"):
+            self.backend.start(
+                self.persistent_slot(state_directory),
+                generation_two,
+                Event(),
+            )
+        properties.write_text("Pkg.Revision=1.0.0\n", encoding="utf-8")
+
+        generation_three = self.root / "generation-three"
+        generation_three.mkdir(mode=0o700)
+        with self.assertRaisesRegex(LeaseError, "profile differs"):
+            self.backend.start(
+                self.persistent_slot(state_directory, memory_mb=1024),
+                generation_three,
+                Event(),
+            )
+        self.assertEqual(manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(marker.read_bytes(), b"must survive profile mismatch")
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+        self.assertEqual(len(self.sdk.calls("emulator")), 1)
+
+    def test_persistent_state_outside_generation_pruning_tree(self):
+        pool_root = self.root / "pool"
+        generations = pool_root / "generations"
+        generations.mkdir(parents=True, mode=0o700)
+        generation = generations / "lease"
+        generation.mkdir(mode=0o700)
+        state_directory = generations / "persistent-state"
+        slot = self.persistent_slot(state_directory)
+        with self.assertRaisesRegex(LeaseError, "outside generations"):
+            self.backend.start(slot, generation, Event())
+        self.assertFalse(state_directory.exists())
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_persistent_state_rejects_another_pools_generation(self):
+        other_pool = Store.initialize(self.root / "other-pool", Config.parse({
+            "schema": 1,
+            "slots": [{
+                "id": "other", "backend": "android", "capabilities": ["android-api-34"],
+                "options": self.sdk.options(self.port),
+            }],
+        }))
+        completed_generation = other_pool.root / "generations" / "completed-request"
+        completed_generation.mkdir(parents=True, mode=0o700)
+        state_directory = completed_generation / "persistent-state"
+        with self.assertRaisesRegex(LeaseError, "outside generations"):
+            self.backend.keys(self.persistent_slot(state_directory))
+        self.assertFalse(state_directory.exists())
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_new_pool_generation_namespace_is_reserved_before_first_request(self):
+        pool = Store.initialize(self.root / "unused-pool", Config.parse({
+            "schema": 1,
+            "slots": [{
+                "id": "other", "backend": "android", "capabilities": ["android-api-34"],
+                "options": self.sdk.options(self.port),
+            }],
+        }))
+        for name in ("generations", "GENERATIONS", "GeNeRaTiOnS"):
+            state = pool.root / name
+            with self.subTest(name=name), self.assertRaisesRegex(LeaseError, "outside generations"):
+                self.backend.keys(self.persistent_slot(state))
+            self.assertFalse(state.exists())
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_foreign_generation_rejection_preserves_existing_state_and_resolves_aliases(self):
+        pool = self.root / "other-pool"
+        pool.mkdir(mode=0o700)
+        (pool / "generations").mkdir(mode=0o700)
+        generation = pool / "generations" / "completed-request"
+        generation.mkdir(mode=0o700)
+        # Even a damaged database must not make a pool's disposable tree safe.
+        (pool / "leases.sqlite3").write_bytes(b"damaged database")
+        state = generation / "persistent-state"
+        state.mkdir(mode=0o700)
+        sentinel = state / "userdata.img"
+        sentinel.write_bytes(b"preserve existing state")
+        alias = self.root / "generation-alias"
+        alias.symlink_to(generation, target_is_directory=True)
+        for path in (state, alias / state.name, generation.parent):
+            with self.subTest(path=path), self.assertRaisesRegex(LeaseError, "outside generations"):
+                self.backend.keys(self.persistent_slot(path))
+        self.assertEqual(sentinel.read_bytes(), b"preserve existing state")
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_generation_name_without_pool_marker_is_not_reserved(self):
+        parent = self.root / "generations"
+        parent.mkdir(mode=0o700)
+        self.assertTrue(self.backend.keys(self.persistent_slot(parent / "state")))
+
+    def test_foreign_generation_case_alias_is_rejected(self):
+        pool = self.root / "other-pool"
+        generation = pool / "generations" / "completed-request"
+        generation.mkdir(parents=True, mode=0o700)
+        (pool / "leases.sqlite3").write_bytes(b"pool marker")
+        alias = pool / "GENERATIONS" / generation.name
+        if not alias.is_dir() or not alias.samefile(generation):
+            self.skipTest("Requires a case-insensitive filesystem")
+        state = alias / "state"
+        with self.assertRaisesRegex(LeaseError, "outside generations"):
+            self.backend.keys(self.persistent_slot(state))
+        self.assertFalse(state.exists())
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_unreadable_pool_marker_does_not_allow_persistent_state(self):
+        parent = self.root / "other-pool" / "generations"
+        parent.mkdir(parents=True, mode=0o700)
+        marker = (parent.parent / "leases.sqlite3").resolve()
+        original_lstat = Path.lstat
+
+        def unreadable_marker(path, *args, **kwargs):
+            if path == marker:
+                raise PermissionError("injected marker access failure")
+            return original_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "lstat", unreadable_marker):
+            with self.assertRaisesRegex(LeaseError, "cannot verify"):
+                self.backend.keys(self.persistent_slot(parent / "state"))
+        self.assertFalse((parent / "state").exists())
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_persistent_state_cannot_be_nested_in_a_direct_backend_generation(self):
+        generation = self.generation()
+        slot = self.persistent_slot(generation / "state")
+        with self.assertRaisesRegex(LeaseError, "outside generations"):
+            resource = self.backend.start(slot, generation, Event())
+            self.addCleanup(resource.stop)
+        self.assertFalse((generation / "state").exists())
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_direct_backend_generation_case_alias_is_rejected(self):
+        generation = self.generation()
+        alias = generation.with_name(generation.name.upper())
+        if not alias.is_dir() or not alias.samefile(generation):
+            self.skipTest("Requires a case-insensitive filesystem")
+        state = alias / "state"
+        with self.assertRaisesRegex(LeaseError, "outside generations"):
+            resource = self.backend.start(self.persistent_slot(state), generation, Event())
+            self.addCleanup(resource.stop)
+        self.assertFalse(state.exists())
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_persistent_startup_quarantine_preserves_partial_state(self):
+        state_directory = self.root / "quarantined-state"
+        generation = self.generation()
+        captured: list[ManagedProcess] = []
+        original_stop = ManagedProcess.stop
+
+        def quarantine_after_spawn(*args):
+            child = args[1]
+            captured.append(child)
+            self.addCleanup(lambda child=child: original_stop(child))
+            marker = self.root / "fake-sdk" / "emulator-started"
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not marker.exists():
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), "fake emulator did not reach direct-child state")
+            raise QuarantineError("injected persistent startup uncertainty")
+
+        with mock.patch.object(self.backend, "_wait_ready", side_effect=quarantine_after_spawn):
+            with self.assertRaisesRegex(QuarantineError, "persistent startup uncertainty"):
+                self.backend.start(
+                    self.persistent_slot(state_directory), generation, Event(),
+                )
+
+        self.assertEqual(len(captured), 1)
+        self.assertIsNotNone(captured[0].poll())
+        manifest = json.loads(
+            (state_directory / ".resource-lease-android-state.json").read_text()
+        )
+        self.assertEqual(manifest["status"], "initializing")
+        self.assertTrue((state_directory / "android-home" / "avd").is_dir())
+        self.assertTrue(all(self._port_free(port) for port in (self.port, self.port + 1)))
 
     def test_invalid_options_are_rejected_before_start(self):
         cases = [
@@ -405,6 +1124,12 @@ class AndroidBackendTests(unittest.TestCase):
         generation = self.generation()
         captured: list[ManagedProcess] = []
         original_stop = ManagedProcess.stop
+        original_launch = android_adapter.launch_child
+
+        def track_launch(*args, **kwargs):
+            child = original_launch(*args, **kwargs)
+            self.addCleanup(lambda: original_stop(child))
+            return child
 
         def quarantine_after_spawn(*args):
             child = args[1]
@@ -420,7 +1145,7 @@ class AndroidBackendTests(unittest.TestCase):
         with mock.patch.object(
             ManagedProcess, "stop",
             side_effect=QuarantineError("injected child-stop uncertainty"),
-        ):
+        ), mock.patch.object(android_adapter, "launch_child", side_effect=track_launch):
             with mock.patch.object(
                 self.backend, "_wait_ready", side_effect=quarantine_after_spawn,
             ):
@@ -482,12 +1207,12 @@ class AndroidBackendTests(unittest.TestCase):
             f"{self.port},{self.port + 1}",
         )
         for flag in (
-            "-no-window", "-no-snapshot", "-no-audio", "-no-boot-anim",
-            "-no-metrics", "-crash-report-mode", "-feature",
+            "-no-window", "-no-snapshot", "-no-boot-anim",
+            "-no-metrics", "-crash-report-mode",
         ):
             self.assertIn(flag, emulator_args)
-        for feature in ("-BluetoothEmulation", "-Uwb", "-Nfc", "-WiFiPacketStream"):
-            self.assertIn(feature, emulator_args)
+        self.assertNotIn("-feature", emulator_args)
+        self.assertNotIn("-no-audio", emulator_args)
 
         adb_calls = self.sdk.calls("adb")
         self.assertTrue(adb_calls)
@@ -498,7 +1223,7 @@ class AndroidBackendTests(unittest.TestCase):
         self.assert_private_home_removed(generation)
         self.assertEqual(
             {path.name for path in generation.iterdir()},
-            {"android-avdmanager.log", "android-emulator.log", "android-adb.log"},
+            {"android-avdmanager.log", "android-emulator.log", "android-adb.log", "android-netsimd.log"},
         )
         for log in generation.iterdir():
             self.assertLessEqual(log.stat().st_size, MAX_LOG_BYTES)

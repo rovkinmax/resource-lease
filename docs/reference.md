@@ -2,7 +2,8 @@
 
 This tool manages a local resource pool without a CI server, task tracker,
 build runner, or package registry. The core is platform-neutral; the
-included Android adapter manages disposable, SDK-created emulators.
+included Android adapter manages disposable emulators by default and supports
+an explicitly configured persistent AVD.
 Python 3.11+ and POSIX file locking are required. It does not install itself.
 
 ## Quick start
@@ -11,8 +12,9 @@ Copy `examples/android.json` to a private configuration file.
 Set absolute paths to your installed SDK and Java home, an already installed
 system image, and unused console/ADB ports. No SDK downloads are performed.
 Each configured slot has capabilities and one image; add slots to configure
-other images or parallel capacity. A slot reserves both its console port and
-the following ADB port.
+other images or parallel capacity. A slot reserves its console port, the
+following ADB port, and transport ports at console+10000 (gRPC) and
+console+20000 (HCI). All four use the existing shared physical-port guards.
 
 From a checkout:
 
@@ -49,9 +51,109 @@ Acquisition's wait loop
 renews only while the acquiring client process is actually running.
 Long work can continue indefinitely with valid renewals.
 
+## Android acquisition readiness
+
+An Android endpoint is published only after ADB is online, Android has booted,
+Package Manager responds, and the primary emulated storage is mounted. The
+adapter also writes, reads back and removes its own exclusive temporary probe.
+A mounted label alone is not considered writable storage.
+
+For clean state, it waits for Android to initialize `Download` and performs
+the probe there. It does not create that standard directory or sleep for a
+fixed grace period. Persistent state is probed at the storage root: a deliberately
+removed `Download` is not recreated and does not prevent acquisition.
+Neither mode monitors `Download` after the lease has been issued.
+
+These checks share the existing `boot_timeout` with transport and emulator
+startup. A failure or cancellation follows normal owned-child cleanup; it
+does not publish an endpoint or extend the boot deadline. Probe failures appear
+in the bounded ADB diagnostic log. An interrupted or failed probe can leave its
+uniquely named temporary file in preserved persistent state; the adapter never
+deletes a pre-existing file to make readiness pass.
+
 Use exact-serial ADB commands while holding the lease. Complete device work
 before release. Losing the lease means stop using the endpoint immediately.
 The tool does not run, stop, or inspect Gradle, IDE, or arbitrary caller jobs.
+
+## Android launch defaults
+
+The selected SDK must include executable `emulator`, `netsimd`, `adb` and
+`avdmanager` tools. Each lease owns an emulator and one same-SDK netsimd direct
+child. An explicit packet-streamer endpoint connects them without shared
+daemon discovery. Even an image with no active netsim-backed capabilities
+gets its own transport process; the adapter does not duplicate SDK feature
+resolution.
+
+SDK/image defaults select Bluetooth, UWB, NFC, Wi-Fi, graphics, cameras and
+other hardware. The adapter no longer forces radio features or audio off.
+It removes ambient `ANDROID_EMULATOR_FEATURES` and `NETSIM_*` overrides from
+these two child environments so unrelated shell experiments cannot redirect
+the default profile. Ordinary proxy/DNS environment remains inherited.
+It does not change the image or existing AVD hardware configuration.
+
+The default remains headless, with cold boot, no snapshot load/save, and no
+boot animation. Metrics and external crash reporting are disabled for
+noninteractive operation. Explicit memory configuration remains a requested
+resource budget, not a hard limit: the SDK can increase undersized requests.
+The normal audio backend may require host permissions; this tool does not
+grant permissions or dismiss prompts.
+
+The transport has explicit per-slot gRPC/HCI ports and instance, bounded
+stderr logs, no CLI/web control UI or synthetic test beacons. The adapter's
+transport startup and emulator readiness share the configured boot deadline.
+SDK automatic shutdown is disabled: a lack of connected netsim devices must
+not shorten a renewing lease. Either child exiting makes the resource unhealthy.
+Every teardown attempts to stop both owned children before checking all four
+ports. A child that ignores termination is killed through its owned live
+handle; uncertain teardown quarantines the slot rather than granting another owner.
+
+Android preferences stay in the private Android home. Transport temporary
+state is generation-local, including in persistent mode. Real HOME remains
+unchanged. Release removes only marked disposable state after child teardown;
+persistent AVD data is preserved.
+
+This launch policy changes default Wi-Fi transport and restores normal audio;
+removing feature overrides does not imply every image supports every radio.
+The [testing guide](testing.md#runtime-qualification) records the tested SDK,
+image and actual lifecycle/storage coverage. Fake-SDK tests alone do not
+establish Bluetooth/network functionality, audio playback, NFC/UWB operation
+or real persistent-mode compatibility.
+The earlier smoke result in `docs/testing.md` describes the previous launch
+policy, not this candidate.
+
+## Android state modes
+
+Android slots accept `state_mode: "clean" | "persistent"`. Omitting
+`state_mode` keeps the existing clean, disposable behavior. Clean mode rejects
+`state_directory`; persistent mode requires an absolute `state_directory`
+whose parent already exists and is owned by the current user. The state
+directory itself must be a private, real directory, not a symlink.
+
+Persistent mode creates one tool-owned AVD under that directory, outside
+`generations/`. Its manifest records the canonical state identity, installed
+image identity, memory profile, and initialization status. Reuse requires a
+complete matching manifest and intact AVD metadata. A newly created AVD becomes
+reusable only after a successful boot. If initialization fails, its partial
+directory and manifest remain; later requests fail closed rather than adopting
+or deleting them. Unknown directories, incompatible image or memory profiles,
+and unexpected state-directory entries are likewise preserved and rejected.
+
+Release and lease expiry stop both owned children but preserve persistent AVD
+data. Persistent directories are not included in generation diagnostic pruning.
+The physical guard includes the canonical state identity as well as all four
+emulator/transport ports, so two pools cannot start the same AVD simultaneously even
+when their configured ports differ. Sequential leases may use different ports.
+A state directory inside any existing pool's `generations/` tree is rejected,
+including parent symlinks and case aliases of the same physical directory.
+Directly below a pool root, that name and its case variants are reserved even
+before the first generation exists. Unrelated directories named `generations`
+outside pools are not reserved. Rejection preserves existing data; it does not
+relocate or repair a previously misplaced state directory.
+
+Keep a persistent state directory dedicated to this tool and profile. Do not
+point it at a developer AVD or open persistent-mode configuration with an
+older binary. There is no automatic reset or recovery command for incomplete
+or incompatible state.
 
 ## Commands and results
 
@@ -99,7 +201,8 @@ After terminal history is pruned, inspection reports not-found, not success
 or authority to replay. A new intentional operation uses a new receipt file.
 
 The private pool contains one SQLite authority, a service singleton lock,
-bounded service logs, and disposable generation directories. Slots have
+bounded service logs, and disposable generation directories. Persistent AVD
+state, when configured, lives separately from those generations. Slots have
 `idle`, `starting`, `leased`, `stopping`, or `quarantined` states.
 Only the service owns backend child handles. Clients mutate intent through
 short SQLite transactions; there is no external coordinator or RPC dependency.
@@ -116,23 +219,27 @@ Physical locks and crash interlocks live in the shared per-user directory
 `RESOURCE_LEASE_HOME` changes this shared namespace for an entire installation,
 including tests; every cooperating pool must use the same value. Changing it
 while resources exist defeats cross-pool exclusion and is unsupported.
-Pool and slot labels do not change physical port keys. This tool is not
-compatible with other emulator managers on the same ports:
-reserve a separate port range.
+Pool and slot labels do not change physical port keys. Persistent Android
+state adds its canonical directory identity to the physical guard. This tool is
+not compatible with other emulator managers on the same ports: reserve a
+separate port range.
 
 ## Failure and recovery boundary
 
 When renewal stops, the healthy service revokes the lease, stops only its own
-emulator using its live child handle, verifies teardown, and creates a fresh
-SDK-owned generation for a compatible waiting caller. A cancellation during
-boot cannot publish a late endpoint. An ordinary start failure is reported
-only after cleanup; uncertain cleanup quarantines that slot.
+emulator and transport using their live child handles, and verifies teardown. A compatible
+waiting caller gets a new disposable AVD in clean mode or the retained AVD in
+persistent mode. A cancellation during boot cannot publish a late endpoint.
+An ordinary start failure is reported only after cleanup; uncertain cleanup
+quarantines that slot.
 
-The Android backend creates AVD state with the installed SDK, in its own
-directory. It does not copy live disk images, adopt existing AVDs, reset
-developer devices, kill adb-server, or signal a PID restored from a file.
-Successful teardown removes only its explicitly disposable AVD data.
-SDK helper controls are part of this adapter's qualified launch profile.
+The Android backend creates AVD state with the installed SDK. Clean mode keeps
+that data in its disposable generation; persistent mode creates a private,
+manifest-owned AVD outside the generation tree. It does not copy live disk
+images, adopt existing AVDs, reset developer devices, kill adb-server, or
+signal a PID restored from a file. Successful clean teardown removes only its
+explicitly disposable AVD data. SDK helper controls are part of this adapter's
+qualified launch profile.
 
 **Service crash is different from client loss.** On service restart, previous
 active custody is quarantined; a durable marker prevents another pool from

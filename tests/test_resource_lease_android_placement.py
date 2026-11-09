@@ -157,7 +157,7 @@ class AndroidPlacementTests(unittest.TestCase):
 
     def test_existing_legacy_root_requires_a_validator_before_claim_publication(self):
         directory = self.root / "legacy"
-        directory.mkdir()
+        directory.mkdir(mode=0o700)
         identity, maintenance = self.paths(directory)
 
         with self.assertRaises(placement_module.LegacyPlacementRegistration):

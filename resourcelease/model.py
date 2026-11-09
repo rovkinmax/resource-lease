@@ -123,3 +123,32 @@ class Backend(Protocol):
         An unknown exception is conservatively treated as uncertain teardown.
         """
         ...
+
+
+class StateMaintenance(Protocol):
+    """Backend-specific physical state operations, called under owned guards."""
+
+    def inspect(self) -> Mapping[str, Any]: ...
+
+    def archive(self, operation_id: str, expected_revision: str,
+                custody: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def restore(self, operation_id: str, backup_id: str, expected_revision: str,
+                custody: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def retire(self, operation_id: str, backup_id: str, expected_revision: str,
+               custody: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def classify_recovery(self, operation_id: str, action: str, expected_revision: str,
+                          backup_id: str | None,
+                          custody: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Read-only proof for exact idle maintenance; never bootstrap or mutate."""
+        ...
+
+
+class MaintenanceBackend(Protocol):
+    def maintenance(self, slot: Slot) -> StateMaintenance: ...
+
+    def maintenance_key(self, slot: Slot) -> str:
+        """Shared state key installed first and cleared last for maintenance."""
+        ...

@@ -155,6 +155,105 @@ point it at a developer AVD or open persistent-mode configuration with an
 older binary. There is no automatic reset or recovery command for incomplete
 or incompatible state.
 
+### Explicit persistent-state maintenance
+
+Persistent state is never reset by acquisition, release, expiry, or a failed
+readiness check. Explicit maintenance is a separate service-owned operation.
+Clean slots reject it; a new clean lease is already disposable.
+
+Before enabling maintenance, update and restart every cooperating service that
+uses the same persistent-state namespace. Mixed old and new callers are not
+supported: older versions do not participate in the placement protocol.
+This is separate from the explicit pool database migration below.
+
+Persistent placement uses durable private sibling name reservations and a short
+shared namespace lock. Reservations remain after archive, restore and retirement;
+do not remove them to bypass a refusal. Existing state identities, manifests and
+AVD paths are preserved. Alternate spellings of an already reserved physical
+name, nested managed state, partial reservations, and names too long for a
+reservation are rejected without moving existing data. The placement lock is
+released before SDK commands and boot; it does not serialize whole leases.
+Waiting for the placement lock is bounded to 30 seconds. Contention beyond
+that limit fails the operation; inspect its original receipt and state before
+retrying. It never bypasses the lock or clears an existing quarantine.
+
+The service can reset an idle persistent slot, or reset a ready resource under
+the caller's original lease receipt. An owned reset retains that lease and all
+physical guards while stopping the old children and starting a replacement.
+Other slots continue operating. Stop and drain device commands before requesting
+a reset: the allocator does not fence arbitrary direct ADB users.
+
+Reset withdraws the endpoint. A successful owned reset publishes a new resource
+generation under the same lease ID and credential. A reused serial string does
+not make an old connection valid. Re-read the lease and reinstall/authenticate
+the application as needed; do not replay an interrupted command automatically.
+The reset wait command renews its lease normally. If the caller disappears,
+normal expiry still applies. If replacement startup fails with proven cleanup,
+the lease remains `held_unavailable`, renewable and releasable, without an
+endpoint. Uncertain teardown quarantines the slot instead.
+
+Idle reset does not boot an emulator. It archives the old state and leaves
+initialization to the next acquisition, so completion does not certify guest
+readiness. The archive retains private application and account data. Keep it
+out of diagnostics uploads. One backup is retained per physical state identity;
+a second reset refuses to proceed until that exact backup is explicitly retired.
+Backups are never automatically pruned.
+
+Commands use a separate private `--operation` receipt. Retry with the same
+receipt; a lost response is not permission to create another reset. Generation
+fences ownership in the pool; state revision separately fences persistent-state
+replacement across pools. Obtain the revision through guarded inspection:
+
+```sh
+resource-lease --root "$POOL" state inspect --slot "$SLOT" \
+  --expect-generation "$GENERATION" --operation "$INSPECTION"
+resource-lease --root "$POOL" reset --slot "$SLOT" \
+  --expect-generation "$GENERATION" --expect-state-revision "$REVISION" \
+  --operation "$RESET"
+```
+
+For a leased resource, substitute `--owner "$OWNER" --lease "$LEASE"` for
+`--slot "$SLOT"` in inspection and reset. The original receipt is mandatory.
+`operation inspect --operation "$RESET"` reads the original operation after a
+timeout or restart; it does not restart an emulator or revive an expired lease.
+Wait timeout or interruption may leave maintenance in progress.
+An operation result preserves the physical-phase snapshot; it is not a live
+state revision after replacement initialization or later use. Inspect state
+again before submitting another revision-fenced operation.
+
+`state restore` and `state retire` require an idle slot, expected generation
+and state revision, explicit `--backup-id`, and their own operation receipt.
+Restore requires the original active state path to be absent; it never overwrites
+an initializing or complete replacement. Restore preserves the old lock state
+too. Retirement deletes only the named verified backup and is irreversible.
+Interrupted retirement cannot turn a partially deleted backup into a restorable
+one. Unknown state, lineage, or crash evidence is preserved and blocks reuse;
+there is no force-clear or automatic repair of incomplete AVD initialization.
+
+After interruption of an **idle** reset, restore, or retirement, use
+`operation recover --operation "$ORIGINAL_OPERATION" --wait 300` to request
+reconciliation of that exact operation. It accepts no replacement target or
+revision. The service verifies the original receipt, quarantined slot binding,
+physical locks, typed maintenance markers, journal, and filesystem topology
+before any continuation. A failed check retains quarantine and the original
+binding. Partial bootstrap or superseded/ambiguous journal evidence remains
+blocked; recovery is not guaranteed for every interruption.
+
+This command cannot recover an owned-lease reset or adopt a lease crash marker.
+It never starts an emulator, revives a lease, takes over a PID, or clears foreign
+custody. Recovery attempts are fenced separately from the immutable original
+operation receipt, so a stale worker cannot publish a later attempt's outcome.
+
+### Database upgrade
+
+Online maintenance uses database schema 2. Opening schema 1 does not implicitly
+migrate it. Explicit `migrate` requires a normally stopped, fully settled pool
+and exclusive service lock, and preserves a private pre-migration database
+backup. Install a compatible executable for every caller before restarting.
+Older schema-1 binaries reject the new database. After any schema-2 effects,
+do not restore the old database over newer leases or try to revive old receipts.
+Use a compatible version to roll forward.
+
 ## Commands and results
 
 All commands take global `--root` before the subcommand.

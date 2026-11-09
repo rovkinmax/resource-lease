@@ -19,6 +19,24 @@ Android VM or download an SDK.
 CI runs these checks on Linux and macOS. Its job timeouts limit hung checks,
 not how long a client may hold a renewed lease.
 
+### Persistent maintenance checks
+
+Maintenance fixtures use temporary state and fake resources, never the installed
+Appsome pool. Cover idle reset alongside another active slot, owned reset with
+the same receipt, endpoint withdrawal, generation change, renewal, release and
+expiry during replacement, and failure without relinquishing custody.
+Physical tests cover continuous guards and stop failure before archival.
+
+Filesystem tests use real temporary directories and absolute AVD locator
+fixtures. Inject rename/fsync/deletion failures, collisions, stale revisions,
+and interrupted retirement. A partially deleted backup must never be restorable.
+Exercise explicit stopped-pool migration independently of live services.
+
+Real reset qualification is a separate opt-in effect. The November 8 lifecycle
+qualification below predates reset and is not evidence that reset works on a
+real AVD. Do not use a shared persistent slot or delete its backup as an implicit
+part of packaging checks.
+
 ## Build and check the packages
 
 From a clean build directory:

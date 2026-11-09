@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 from test_resource_lease_android import make_fake_android_sdk  # noqa: E402
 
 
-def check(command, directory):
+def check(command, directory, *, persistent=False):
     fixture = make_fake_android_sdk(directory / "sdk")
     port = None
     for candidate in range(5600, 5682, 2):
@@ -31,10 +31,13 @@ def check(command, directory):
     if port is None:
         raise RuntimeError("no free fake-SDK port pair")
     config = directory / "config.json"
+    options = fixture.options(port)
+    if persistent:
+        options.update(state_mode="persistent", state_directory=str(directory / "state"))
     config.write_text(json.dumps({
         "schema": 1,
         "slots": [{"id": "test", "backend": "android", "capabilities": ["test"],
-                   "options": fixture.options(port)}],
+                   "options": options}],
     }))
     pool = directory / "pool"
     receipt = directory / "job.lease.json"
@@ -54,8 +57,26 @@ def check(command, directory):
     call("init", "--config", config)
     try:
         assert call("start")["service"]["available"]
-        assert call("acquire", "--owner", "test", "--capability", "test",
-                    "--lease", receipt, "--wait", "20")["state"] == "active"
+        active = call("acquire", "--owner", "test", "--capability", "test",
+                      "--lease", receipt, "--wait", "20")
+        assert active["state"] == "active"
+        if persistent:
+            inspected = call(
+                "state", "inspect", "--owner", "test", "--lease", receipt,
+                "--expect-generation", active["generation"],
+                "--operation", directory / "inspect.operation.json", "--wait", "20",
+            )
+            reset = call(
+                "reset", "--owner", "test", "--lease", receipt,
+                "--expect-generation", active["generation"],
+                "--expect-state-revision", inspected["result"]["revision"],
+                "--operation", directory / "reset.operation.json", "--wait", "20",
+            )
+            assert reset["state"] == "completed"
+            replacement = call("inspect", "--owner", "test", "--lease", receipt)
+            assert replacement["id"] == active["id"]
+            assert replacement["state"] == "active" and replacement["endpoint"]
+            assert replacement["generation"] > active["generation"]
         assert call("renew", "--owner", "test", "--lease", receipt)["state"] == "active"
         released = call("release", "--owner", "test", "--lease", receipt, "--wait", "20")
         assert released["state"] == "completed" and not released["cleanup_pending"]
@@ -65,7 +86,7 @@ def check(command, directory):
         assert state["slots"][0]["state"] == "idle"
         # Status is durable before the service releases its final OS lock.
         time.sleep(0.3)
-    print(f"Passed: {' '.join(command)}")
+    print(f"Passed ({'persistent reset' if persistent else 'clean'}): {' '.join(command)}")
 
 
 def main():
@@ -86,6 +107,9 @@ def main():
             directory = Path(temporary) / str(index)
             directory.mkdir()
             check(command, directory)
+            persistent = Path(temporary) / f"{index}-persistent"
+            persistent.mkdir()
+            check(command, persistent, persistent=True)
 
 
 if __name__ == "__main__":

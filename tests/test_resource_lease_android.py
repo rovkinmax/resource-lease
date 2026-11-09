@@ -15,6 +15,7 @@ from unittest import mock
 
 from resourcelease.backends import android as android_adapter
 from resourcelease.backends.android import AndroidBackend
+from resourcelease.backends.android_placement import AndroidPlacement
 from resourcelease.model import Config, LeaseError, QuarantineError, Slot
 from resourcelease.process import (
     CommandResult, CommandTimeout, ManagedProcess, launch_child, run_command,
@@ -360,7 +361,7 @@ class AndroidBackendTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.sdk = make_fake_android_sdk(self.root / "fake-sdk")
-        self.backend = AndroidBackend()
+        self.backend = AndroidBackend(placement=AndroidPlacement(self.root / "guards"))
         try:
             self.port = free_console_port()
         except RuntimeError as error:
@@ -391,6 +392,47 @@ class AndroidBackendTests(unittest.TestCase):
 
     def assert_private_home_removed(self, generation: Path) -> None:
         self.assertFalse((generation / "android-home").exists())
+
+    def test_backend_construction_and_keys_do_not_create_placement_metadata(self):
+        guards = self.root / "unused-guards"
+        backend = AndroidBackend(placement=AndroidPlacement(guards))
+        state = self.root / "unused-state"
+        before = set(self.root.iterdir())
+        backend.keys(self.persistent_slot(state))
+        self.assertEqual(set(self.root.iterdir()), before)
+        self.assertFalse(guards.exists())
+        self.assertFalse(state.exists())
+
+    def test_persistent_sdk_commands_run_outside_placement_transaction(self):
+        original = android_adapter.run_command
+        checks = []
+
+        def checked_command(*args, **kwargs):
+            acquired = Event()
+            failures = []
+
+            def acquire_from_other_thread():
+                try:
+                    with self.backend.placement.transaction():
+                        acquired.set()
+                except BaseException as error:
+                    failures.append(error)
+
+            contender = Thread(target=acquire_from_other_thread, daemon=True)
+            contender.start()
+            self.addCleanup(contender.join, 5)
+            self.assertTrue(acquired.wait(3), "placement gate retained during SDK command")
+            contender.join(3)
+            self.assertFalse(failures)
+            checks.append(True)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(android_adapter, "run_command", side_effect=checked_command):
+            resource = self.backend.start(
+                self.persistent_slot(self.root / "persistent-state"), self.generation(), Event(),
+            )
+            self.addCleanup(resource.stop)
+        self.assertTrue(checks)
 
     def test_default_capabilities_use_owned_transport_without_feature_overrides(self):
         resource = self.backend.start(self.slot(), self.generation(), Event())

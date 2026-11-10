@@ -24,6 +24,9 @@ from resourcelease.backends.android_state import (
     require_outside_generation,
     state_identity,
 )
+from resourcelease.backends.android_maintenance import AndroidMaintenance
+from resourcelease.backends.android_placement import AndroidPlacement
+from resourcelease.namespace import default_guard_root
 from resourcelease.process import (
     CommandCancelled,
     CommandTimeout,
@@ -460,6 +463,25 @@ def _command_error(label: str, result, timeout: float | None = None) -> LeaseErr
 class AndroidBackend:
     """Supervise an SDK-owned disposable or explicitly persistent AVD."""
 
+    def __init__(self, *, placement: AndroidPlacement | None = None):
+        self.placement = placement if placement is not None else AndroidPlacement(default_guard_root())
+
+    def maintenance(self, slot: Slot) -> AndroidMaintenance:
+        options = _parse_options(slot)
+        if options.state_mode != "persistent" or options.state_directory is None:
+            raise LeaseError("state maintenance requires a persistent Android slot")
+        return AndroidMaintenance(
+            options.state_directory, system_image=options.system_image,
+            image_identity=options.image_identity, memory_mb=options.memory_mb,
+            placement=self.placement,
+        )
+
+    def maintenance_key(self, slot: Slot) -> str:
+        options = _parse_options(slot)
+        if options.state_mode != "persistent" or options.state_directory is None:
+            raise LeaseError("state maintenance requires a persistent Android slot")
+        return f"android-state:{state_identity(options.state_directory)}"
+
     def keys(self, slot: Slot) -> tuple[str, ...]:
         options = _parse_options(slot)
         keys = [f"tcp-port:{port}" for port in options.ports]
@@ -473,17 +495,22 @@ class AndroidBackend:
         generation = _require_generation(directory)
         _assert_ports_free(options)
         persistent_state = None
+        maintenance = None
         if options.state_mode == "persistent":
             if cancelled.is_set():
                 raise LeaseError("Android resource start cancelled before state preparation")
             assert options.state_directory is not None
             require_outside_generation(options.state_directory, generation)
-            persistent_state = PersistentAndroidState.prepare(
-                options.state_directory,
-                system_image=options.system_image,
-                image_identity=options.image_identity,
-                memory_mb=options.memory_mb,
-            )
+            maintenance = self.maintenance(slot)
+            with self.placement.transaction():
+                maintenance.check_start()
+                persistent_state = PersistentAndroidState.prepare(
+                    options.state_directory,
+                    system_image=options.system_image,
+                    image_identity=options.image_identity,
+                    memory_mb=options.memory_mb,
+                    placement=self.placement,
+                )
             private_home = persistent_state.private_home
             avd_home = persistent_state.avd_home
             marker = None
@@ -581,6 +608,8 @@ class AndroidBackend:
             self._wait_ready(options, child, environment, adb_log, cancelled, netsimd, deadline)
             if persistent_state is not None and not persistent_state.complete:
                 persistent_state.mark_complete()
+            if maintenance is not None:
+                maintenance.publish_complete()
             return AndroidResource(
                 self, options, generation, runtime_home, marker, persistent_state, environment,
                 avd_name, child, emulator_log, adb_log, netsimd,

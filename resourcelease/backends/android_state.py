@@ -10,7 +10,9 @@ import stat
 import uuid
 from typing import Mapping
 
+from resourcelease.backends.android_placement import AndroidPlacement
 from resourcelease.model import LeaseError
+from resourcelease.namespace import default_guard_root
 
 
 MANIFEST_NAME = ".resource-lease-android-state.json"
@@ -18,6 +20,16 @@ MANIFEST_SCHEMA = "resource-lease-android-state-v1"
 MAX_MANIFEST_BYTES = 16 * 1024
 MAX_AVD_INI_BYTES = 64 * 1024
 MAX_CONFIG_BYTES = 1024 * 1024
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise LeaseError("cannot safely inspect Android state_directory") from error
 
 
 def canonical_state_directory(value: object) -> Path:
@@ -220,7 +232,9 @@ class PersistentAndroidState:
         system_image: str,
         image_identity: Mapping[str, object],
         memory_mb: int,
+        placement: AndroidPlacement | None = None,
     ) -> "PersistentAndroidState":
+        directory = canonical_state_directory(os.fspath(directory))
         identity = state_identity(directory)
         avd_name = f"resource_lease_{identity[:16]}"
         profile = {
@@ -228,46 +242,73 @@ class PersistentAndroidState:
             "image_identity": dict(image_identity),
             "memory_mb": memory_mb,
         }
-        try:
-            directory.mkdir(mode=0o700, exist_ok=False)
-        except FileExistsError:
-            return cls._open_existing(directory, identity, avd_name, profile)
-        except OSError as error:
-            raise LeaseError(
-                f"cannot create Android state_directory: {directory}"
-            ) from error
+        placement = placement or AndroidPlacement(default_guard_root())
+        maintenance_directory = directory.parent / (
+            ".resource-lease-android-maintenance-" + identity
+        )
+        with placement.transaction():
+            if _path_exists(directory):
+                existing = cls._open_existing(directory, identity, avd_name, profile)
+                placement.reserve(
+                    directory,
+                    identity,
+                    maintenance_directory,
+                    legacy_validator=lambda: cls._open_existing(
+                        directory, identity, avd_name, profile,
+                    ),
+                )
+                return existing
 
-        try:
-            _require_private_directory(directory, "Android state_directory")
-            state = cls(
-                directory=directory,
-                private_home=directory / "android-home",
-                avd_home=directory / "android-home" / "avd",
-                avd_name=avd_name,
-                identity=identity,
-                profile=profile,
-                manifest={
-                    "schema": MANIFEST_SCHEMA,
-                    "owner": "resource-lease",
-                    "state_identity": identity,
-                    "profile": profile,
-                    "avd_name": avd_name,
-                    "status": "initializing",
-                },
-            )
-            state._write_new_manifest()
-            state.private_home.mkdir(mode=0o700, exist_ok=False)
-            _require_private_directory(state.private_home, "persistent Android home")
-            state.avd_home.mkdir(mode=0o700, exist_ok=False)
-            _require_private_directory(state.avd_home, "persistent Android AVD home")
-            _sync_directory(directory)
-            return state
-        except LeaseError:
-            raise
-        except OSError as error:
-            raise LeaseError(
-                "persistent Android state initialization failed; partial data was preserved"
-            ) from error
+            placement.reserve(directory, identity, maintenance_directory)
+            try:
+                directory.mkdir(mode=0o700, exist_ok=False)
+            except FileExistsError:
+                existing = cls._open_existing(directory, identity, avd_name, profile)
+                placement.reserve(
+                    directory,
+                    identity,
+                    maintenance_directory,
+                    legacy_validator=lambda: cls._open_existing(
+                        directory, identity, avd_name, profile,
+                    ),
+                )
+                return existing
+            except OSError as error:
+                raise LeaseError(
+                    f"cannot create Android state_directory: {directory}"
+                ) from error
+
+            try:
+                _require_private_directory(directory, "Android state_directory")
+                state = cls(
+                    directory=directory,
+                    private_home=directory / "android-home",
+                    avd_home=directory / "android-home" / "avd",
+                    avd_name=avd_name,
+                    identity=identity,
+                    profile=profile,
+                    manifest={
+                        "schema": MANIFEST_SCHEMA,
+                        "owner": "resource-lease",
+                        "state_identity": identity,
+                        "profile": profile,
+                        "avd_name": avd_name,
+                        "status": "initializing",
+                    },
+                )
+                state._write_new_manifest()
+                state.private_home.mkdir(mode=0o700, exist_ok=False)
+                _require_private_directory(state.private_home, "persistent Android home")
+                state.avd_home.mkdir(mode=0o700, exist_ok=False)
+                _require_private_directory(state.avd_home, "persistent Android AVD home")
+                _sync_directory(directory)
+                return state
+            except LeaseError:
+                raise
+            except OSError as error:
+                raise LeaseError(
+                    "persistent Android state initialization failed; partial data was preserved"
+                ) from error
 
     @classmethod
     def _open_existing(

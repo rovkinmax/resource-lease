@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 from resourcelease.backends.android import AndroidBackend
+from resourcelease.backends.android_placement import AndroidPlacement
 from resourcelease.model import Config, LeaseError, QuarantineError
 from resourcelease.service import Busy, Guard, Service
 from resourcelease.store import Store, private_directory
@@ -105,7 +106,10 @@ class ServiceTests(unittest.TestCase):
             }],
         })
         store = Store.initialize(self.root / label, config)
-        service = Service(store, {"android": AndroidBackend()}, guard_root=self.guard_root)
+        service = Service(
+            store, {"android": AndroidBackend(placement=AndroidPlacement(self.guard_root))},
+            guard_root=self.guard_root,
+        )
         thread = Thread(target=service.serve)
         self.services.append((service, thread))
         thread.start()

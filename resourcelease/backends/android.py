@@ -800,6 +800,7 @@ class AndroidBackend:
                 timeout=COMMAND_TIMEOUT,
                 log_path=log_path,
                 append_log=True,
+                hold_stdin_open=True,
             )
             return boot.returncode == 0 and boot.output.strip() == "1"
         except QuarantineError:

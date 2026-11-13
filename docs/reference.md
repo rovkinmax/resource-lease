@@ -103,6 +103,11 @@ stderr logs, no CLI/web control UI or synthetic test beacons. The adapter's
 transport startup and emulator readiness share the configured boot deadline.
 SDK automatic shutdown is disabled: a lack of connected netsim devices must
 not shorten a renewing lease. Either child exiting makes the resource unhealthy.
+Ongoing boot health checks keep an empty stdin pipe open until the command exits
+or its bounded stop/reap attempt finishes. This avoids premature stdin EOF on
+older Android shells. Only these checks opt in; acquisition and `get-state`
+retain their existing stdin behavior. Health still requires exit status zero
+and boot output equal to `1` after stripping whitespace; status 255 is not success.
 Every teardown attempts to stop both owned children before checking all four
 ports. A child that ignores termination is killed through its owned live
 handle; uncertain teardown quarantines the slot rather than granting another owner.

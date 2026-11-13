@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 from threading import Event, Thread
 import time
 from typing import Mapping, Sequence
@@ -286,6 +287,7 @@ def run_command(
     log_limit: int = MAX_LOG_BYTES,
     append_log: bool = False,
     capture_limit: int = MAX_COMMAND_OUTPUT,
+    hold_stdin_open: bool = False,
 ) -> CommandResult:
     """Run one direct child with bounded time, stdin, memory and disk output."""
     if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
@@ -297,6 +299,10 @@ def run_command(
         raise LeaseError("command input must be bytes")
     if input_data is not None and len(input_data) > MAX_COMMAND_INPUT:
         raise LeaseError("command input exceeds the bounded 4 KiB limit")
+    if type(hold_stdin_open) is not bool:
+        raise LeaseError("held-open stdin mode must be a boolean")
+    if hold_stdin_open and input_data is not None:
+        raise LeaseError("held-open stdin mode cannot send bounded input")
     _validate_log_limit(log_limit)
     if (isinstance(capture_limit, bool) or not isinstance(capture_limit, int)
             or not 0 <= capture_limit <= MAX_COMMAND_OUTPUT):
@@ -308,7 +314,7 @@ def run_command(
     try:
         process = subprocess.Popen(
             [os.fspath(value) for value in argv],
-            stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
+            stdin=subprocess.PIPE if input_data is not None or hold_stdin_open else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=dict(env),
@@ -318,70 +324,118 @@ def run_command(
     except OSError as error:
         raise LeaseError(f"cannot run SDK command: {os.fspath(argv[0])}") from error
 
-    collector = _OutputCollector(
-        process.stdout, Path(log_path), log_limit=log_limit,
-        capture_limit=capture_limit, append=append_log,
-    )
+    collector = None
     try:
-        collector.start()
-    except BaseException:
-        _stop_after_setup_failure(process)
-        collector.close_if_not_started()
-        raise
-
-    if input_data is not None and process.stdin is not None:
-        input_error = None
         try:
-            process.stdin.write(input_data)
-            process.stdin.flush()
-        except BrokenPipeError:
-            pass
-        except OSError as error:
-            input_error = error
-        finally:
+            collector = _OutputCollector(
+                process.stdout, Path(log_path), log_limit=log_limit,
+                capture_limit=capture_limit, append=append_log,
+            )
+            collector.start()
+        except BaseException:
             try:
-                process.stdin.close()
+                try:
+                    _stop_after_setup_failure(process)
+                except OSError as error:
+                    if hold_stdin_open:
+                        raise QuarantineError("held-stdin child setup cleanup is uncertain") from error
+                    raise
+            finally:
+                primary = sys.exception()
+                try:
+                    if collector is not None:
+                        if collector._thread.ident is not None:
+                            collector.join()
+                        else:
+                            collector.close_if_not_started()
+                    elif process.stdout is not None:
+                        process.stdout.close()
+                except BaseException:
+                    if isinstance(primary, QuarantineError):
+                        raise primary
+                    raise
+            raise
+
+        if input_data is not None and process.stdin is not None:
+            input_error = None
+            try:
+                process.stdin.write(input_data)
+                process.stdin.flush()
             except BrokenPipeError:
                 pass
             except OSError as error:
-                input_error = input_error or error
-        if input_error is not None:
+                input_error = error
+            finally:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+                except OSError as error:
+                    input_error = input_error or error
+            if input_error is not None:
+                child = ManagedProcess(process, collector)
+                child.stop()
+                raise LeaseError("failed to send bounded input to direct child") from input_error
+
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                if cancelled is not None and cancelled.is_set():
+                    child = ManagedProcess(process, collector)
+                    try:
+                        child.stop()
+                    except OSError as error:
+                        if hold_stdin_open:
+                            raise QuarantineError("held-stdin child stop/reap is uncertain") from error
+                        raise
+                    details = child.output.strip()[:1200]
+                    suffix = f": {details}" if details else ""
+                    raise CommandCancelled(f"SDK command cancelled{suffix}; bounded log: {log_path}")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    child = ManagedProcess(process, collector)
+                    try:
+                        child.stop()
+                    except OSError as error:
+                        if hold_stdin_open:
+                            raise QuarantineError("held-stdin child stop/reap is uncertain") from error
+                        raise
+                    details = child.output.strip()[:1200]
+                    suffix = f": {details}" if details else ""
+                    raise CommandTimeout(
+                        f"SDK command timed out after {timeout:g}s{suffix}; bounded log: {log_path}"
+                    )
+                try:
+                    returncode = process.wait(timeout=min(POLL_INTERVAL, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            collector.join()
+        except (CommandCancelled, CommandTimeout, QuarantineError):
+            raise
+        except BaseException:
             child = ManagedProcess(process, collector)
-            child.stop()
-            raise LeaseError("failed to send bounded input to direct child") from input_error
+            if child.poll() is None:
+                try:
+                    child.stop()
+                except OSError as error:
+                    if hold_stdin_open:
+                        raise QuarantineError("held-stdin child stop/reap is uncertain") from error
+                    raise
+            raise
 
-    deadline = time.monotonic() + timeout
-    try:
-        while True:
-            if cancelled is not None and cancelled.is_set():
-                child = ManagedProcess(process, collector)
-                child.stop()
-                details = child.output.strip()[:1200]
-                suffix = f": {details}" if details else ""
-                raise CommandCancelled(f"SDK command cancelled{suffix}; bounded log: {log_path}")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                child = ManagedProcess(process, collector)
-                child.stop()
-                details = child.output.strip()[:1200]
-                suffix = f": {details}" if details else ""
-                raise CommandTimeout(
-                    f"SDK command timed out after {timeout:g}s{suffix}; bounded log: {log_path}"
-                )
+        if collector.error is not None:
+            raise LeaseError(
+                f"failed while recording bounded command output: {log_path}"
+            ) from collector.error
+        return CommandResult(returncode, collector.output, Path(log_path))
+    finally:
+        if hold_stdin_open and process.stdin is not None:
+            # Keep the empty pipe open through native exit or the bounded
+            # stop/reap attempt. Never send data or close it at launch time.
+            primary = sys.exception()
             try:
-                returncode = process.wait(timeout=min(POLL_INTERVAL, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                continue
-        collector.join()
-    except (CommandCancelled, CommandTimeout):
-        raise
-    except BaseException:
-        child = ManagedProcess(process, collector)
-        if child.poll() is None:
-            child.stop()
-        raise
-
-    if collector.error is not None:
-        raise LeaseError(f"failed while recording bounded command output: {log_path}") from collector.error
-    return CommandResult(returncode, collector.output, Path(log_path))
+                process.stdin.close()
+            except OSError as error:
+                if not isinstance(primary, QuarantineError):
+                    raise QuarantineError("owned held-open stdin closure is uncertain") from error

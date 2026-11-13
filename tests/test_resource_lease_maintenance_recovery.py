@@ -1,5 +1,6 @@
 """Reach the physical recovery protocol through the public CLI after restart."""
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import io
 import json
 import os
@@ -12,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from resourcelease.backends.android import AndroidBackend
-from resourcelease.backends.android_placement import AndroidPlacement
+from resourcelease.backends.android_placement import AndroidPlacement, GATE_NAME
 from resourcelease.backends.android_maintenance import AndroidMaintenance
 from resourcelease.backends.android_state import PersistentAndroidState
 from resourcelease.cli import main, write_private_receipt
@@ -343,7 +344,8 @@ os._exit(73)
         store, backend, _maintenance, guards, receipt, path = (
             self.seed_interrupted_archive(after_rename=False)
         )
-        foreign = next(guards.iterdir())
+        key = backend.maintenance_key(store.config.slots[0])
+        foreign = guards / (hashlib.sha256(key.encode()).hexdigest() + ".lock")
         foreign.write_bytes(b'{"schema":1,"pool":"foreign","lease":"do-not-touch"}\n')
         before = {item.name: item.read_bytes() for item in guards.iterdir()}
         self.start_service(store, backend, guards)
@@ -356,6 +358,7 @@ os._exit(73)
         self.assertEqual(slot["state"], "quarantined")
         self.assertEqual(slot["operation_id"], receipt["id"])
         self.assertEqual(before, {item.name: item.read_bytes() for item in guards.iterdir()})
+        self.assertEqual((guards / GATE_NAME).read_bytes(), b"")
 
 
 if __name__ == "__main__":

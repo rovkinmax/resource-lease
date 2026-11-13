@@ -356,6 +356,66 @@ class ProcessHelperTests(unittest.TestCase):
 
 
 class AndroidBackendTests(unittest.TestCase):
+    def test_ongoing_health_holds_only_boot_stdin_and_preserves_cache(self):
+        (self.root / "generation").mkdir()
+        original = android_adapter.run_command
+        with mock.patch.object(android_adapter, "run_command", wraps=original) as command:
+            resource = self.backend.start(self.slot(), self.root / "generation", Event())
+            self.addCleanup(resource.stop)
+            self.assertTrue(command.call_args_list)
+            self.assertTrue(all(not call.kwargs.get("hold_stdin_open", False)
+                                for call in command.call_args_list))
+            command.reset_mock()
+            self.assertTrue(resource.healthy())
+            self.assertEqual(command.call_count, 2)
+            state, boot = command.call_args_list
+            self.assertEqual(state.args[0][-1], "get-state")
+            self.assertFalse(state.kwargs.get("hold_stdin_open", False))
+            self.assertEqual(boot.args[0][-3:], ["shell", "getprop", "sys.boot_completed"])
+            self.assertIs(boot.kwargs.get("hold_stdin_open"), True)
+            self.assertEqual(boot.kwargs["timeout"], 5.0)
+            self.assertTrue(resource.healthy())
+            self.assertEqual(command.call_count, 2)
+            with mock.patch.object(resource._child, "poll", return_value=1):
+                self.assertFalse(resource.healthy())
+            self.assertEqual(command.call_count, 2)
+
+    def test_ongoing_health_boolean_predicate_and_quarantine(self):
+        (self.root / "generation").mkdir()
+        resource = self.backend.start(self.slot(), self.root / "generation", Event())
+        self.addCleanup(resource.stop)
+        ready = CommandResult(0, "device\n", self.root / "log")
+        for status, output, expected in (
+            (0, "1\n", True), (0, "0", False), (0, "", False),
+            (0, "1\nwarning", False), (255, "1", False),
+        ):
+            with self.subTest(status=status, output=output), mock.patch.object(
+                android_adapter, "run_command",
+                side_effect=[ready, CommandResult(status, output, self.root / "log")],
+            ) as command:
+                self.assertIs(self.backend._check_ready(
+                    resource._options, resource._environment, resource._adb_log,
+                ), expected)
+                self.assertIs(command.call_args.kwargs.get("hold_stdin_open"), True)
+        for error in (LeaseError("ordinary"), QuarantineError("uncertain")):
+            with mock.patch.object(android_adapter, "run_command", side_effect=error):
+                if isinstance(error, QuarantineError):
+                    with self.assertRaises(QuarantineError):
+                        self.backend._check_ready(
+                            resource._options, resource._environment, resource._adb_log,
+                        )
+                else:
+                    self.assertFalse(self.backend._check_ready(
+                        resource._options, resource._environment, resource._adb_log,
+                    ))
+        with mock.patch.object(android_adapter, "run_command", return_value=CommandResult(
+            1, "device", self.root / "log",
+        )) as command:
+            self.assertFalse(self.backend._check_ready(
+                resource._options, resource._environment, resource._adb_log,
+            ))
+            self.assertEqual(command.call_count, 1)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

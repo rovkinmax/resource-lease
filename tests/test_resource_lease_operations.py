@@ -28,7 +28,7 @@ def operation_call(operations, method, operation, *args, **kwargs):
     return getattr(operations, method)(operation["id"], *args, **kwargs)
 
 
-def make_schema1_pool(root, *, service_state="stopped", request_state=None):
+def make_schema1_pool(root, *, service_state="stopped", request_state=None, slot_options=None):
     root.mkdir(mode=0o700)
     connection = sqlite3.connect(root / "leases.sqlite3")
     connection.executescript("""
@@ -51,7 +51,10 @@ def make_schema1_pool(root, *, service_state="stopped", request_state=None):
         PRAGMA user_version=1;
     """)
     pool_id = "pool-before-migration"
-    config = Config.parse(persistent_configuration()).document()
+    config_document = persistent_configuration()
+    if slot_options is not None:
+        config_document["slots"][0]["options"] = slot_options
+    config = Config.parse(config_document).document()
     connection.executemany(
         "INSERT INTO metadata(key,value) VALUES (?,?)",
         [("pool_id", pool_id), ("config", json.dumps(config, sort_keys=True,
@@ -876,6 +879,18 @@ class OperationsTests(unittest.TestCase):
             Store.migrate(schema1_root)
         with closing(sqlite3.connect(schema1_root / "leases.sqlite3")) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+
+    def test_schema1_migration_preserves_explicit_tv_profile(self):
+        root = Path(self.temporary.name) / "schema1-tv"
+        options = {"state_mode": "persistent", "device_profile": "tv_1080p"}
+        pool_id = make_schema1_pool(root, slot_options=options)
+        with closing(sqlite3.connect(root / "leases.sqlite3")) as connection:
+            connection.execute("UPDATE slots SET generation=5 WHERE id='one'")
+            connection.commit()
+        migrated = Store.migrate(root)
+        self.assertEqual(migrated.pool_id, pool_id)
+        self.assertEqual(migrated.config.slots[0].options, options)
+        self.assertEqual(migrated.status()["slots"][0]["generation"], 5)
 
     def test_migration_requires_stopped_settled_pool_and_available_lock(self):
         running = Path(self.temporary.name) / "running"

@@ -57,6 +57,8 @@ An Android endpoint is published only after ADB is online, Android has booted,
 Package Manager responds, and the primary emulated storage is mounted. The
 adapter also writes, reads back and removes its own exclusive temporary probe.
 A mounted label alone is not considered writable storage.
+Older Android shells can resolve the primary directory without `readlink -f`
+and inspect the mount table without creating shell temporary files.
 
 For clean state, it waits for Android to initialize `Download` and performs
 the probe there. It does not create that standard directory or sleep for a
@@ -127,6 +129,21 @@ establish Bluetooth/network functionality, audio playback, NFC/UWB operation
 or real persistent-mode compatibility.
 The earlier smoke result in `docs/testing.md` describes the previous launch
 policy, not this candidate.
+
+## Android device profiles
+
+Android slots optionally accept `device_profile`, a stable ID from the
+installed SDK, such as `tv_1080p` in `examples/android-tv.json`. The backend
+passes it to `avdmanager create avd --device`. It does not infer the hardware
+profile from the image or download SDK components. Without this option,
+the SDK selects its default hardware profile.
+
+An ID starts with an ASCII letter and contains at most 128 ASCII letters,
+digits, underscores, dots or hyphens. An ID missing from the installed SDK
+fails through normal AVD creation. An explicit ID is part of the persistent
+profile: adding, changing or removing it rejects incompatible existing state
+without editing or deleting that state. Omitting the option keeps the
+previous manifest format and profile.
 
 ## Android state modes
 

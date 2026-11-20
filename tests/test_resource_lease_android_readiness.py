@@ -81,6 +81,7 @@ class AndroidReadinessScriptTests(unittest.TestCase):
             "emulated;10 mounted null", "",
             "emulated;10 mounted null\nemulated;0 checking null",
             "emulated mounted null\nemulated;0 mounted null",
+            "emulated;0\nemulated;0 mounted null",
         ):
             with self.subTest(volume=volume):
                 self.assertNotEqual(self.run_probe(VOLUMES=volume).returncode, 0)
@@ -92,6 +93,23 @@ class AndroidReadinessScriptTests(unittest.TestCase):
             VOLUMES="emulated;0 checking null\nemulated;10 mounted null",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_no_probe()
+
+    def test_legacy_shell_can_resolve_a_physical_directory_when_readlink_fails(self):
+        # The host fixture lives outside /storage. Model only the guest's
+        # physical directory builtins; the storage write probe stays real.
+        prefix = (
+            'readlink() { return 1; }\n'
+            'cd() { [ "$1" = "-P" ] && [ "$2" = "$storage" ] && [ -d "$2" ]; }\n'
+            'pwd() { [ "$1" = "-P" ] && echo /storage/emulated/10; }\n'
+        )
+        result = self.run_probe(prefix=prefix, VOLUMES="emulated;10 mounted null")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_no_probe()
+
+        result = self.run_probe(prefix=prefix, VOLUMES="emulated;10 checking null")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Primary storage not mounted", result.stderr)
         self.assert_no_probe()
 
     def test_package_manager_path_and_storage_manager_errors_fail_closed(self):

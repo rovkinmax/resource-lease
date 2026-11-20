@@ -22,6 +22,22 @@ MAX_AVD_INI_BYTES = 64 * 1024
 MAX_CONFIG_BYTES = 1024 * 1024
 
 
+def persistent_android_profile(
+    system_image: str,
+    image_identity: Mapping[str, object],
+    memory_mb: int,
+    device_profile: str | None,
+) -> dict[str, object]:
+    profile: dict[str, object] = {
+        "system_image": system_image,
+        "image_identity": dict(image_identity),
+        "memory_mb": memory_mb,
+    }
+    if device_profile is not None:
+        profile["device_profile"] = device_profile
+    return profile
+
+
 def _path_exists(path: Path) -> bool:
     try:
         path.lstat()
@@ -232,16 +248,13 @@ class PersistentAndroidState:
         system_image: str,
         image_identity: Mapping[str, object],
         memory_mb: int,
+        device_profile: str | None = None,
         placement: AndroidPlacement | None = None,
     ) -> "PersistentAndroidState":
         directory = canonical_state_directory(os.fspath(directory))
         identity = state_identity(directory)
         avd_name = f"resource_lease_{identity[:16]}"
-        profile = {
-            "system_image": system_image,
-            "image_identity": dict(image_identity),
-            "memory_mb": memory_mb,
-        }
+        profile = persistent_android_profile(system_image, image_identity, memory_mb, device_profile)
         placement = placement or AndroidPlacement(default_guard_root())
         maintenance_directory = directory.parent / (
             ".resource-lease-android-maintenance-" + identity

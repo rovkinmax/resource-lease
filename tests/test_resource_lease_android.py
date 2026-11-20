@@ -577,31 +577,37 @@ class AndroidBackendTests(unittest.TestCase):
         transport = mock.Mock()
         transport.poll.return_value = None
         log = self.root / "adb.log"
-        now = [0.0]
-        clock = mock.Mock(wraps=time)
-        clock.monotonic.side_effect = lambda: now[0]
-        timeouts = []
+        for failure in ("Unsupported primary storage", "injected storage command timeout"):
+            with self.subTest(failure=failure):
+                now = [0.0]
+                clock = mock.Mock(wraps=time)
+                clock.monotonic.side_effect = lambda: now[0]
+                timeouts = []
 
-        def observe(arguments, **kwargs):
-            timeouts.append(kwargs["timeout"])
-            if arguments[3:] == ["get-state"]:
-                now[0] = 0.25
-                return CommandResult(0, "device", log)
-            if arguments[3:] == ["shell", "getprop", "sys.boot_completed"]:
-                now[0] = 0.5
-                return CommandResult(0, "1", log)
-            self.assertEqual(arguments[3:6], ["shell", "sh", "-c"])
-            now[0] = 1.0
-            raise CommandTimeout("injected storage command timeout")
+                def observe(arguments, **kwargs):
+                    timeouts.append(kwargs["timeout"])
+                    if arguments[3:] == ["get-state"]:
+                        now[0] = 0.25
+                        return CommandResult(0, "device", log)
+                    if arguments[3:] == ["shell", "getprop", "sys.boot_completed"]:
+                        now[0] = 0.5
+                        return CommandResult(0, "1", log)
+                    self.assertEqual(arguments[3:6], ["shell", "sh", "-c"])
+                    now[0] = 1.0
+                    if failure == "Unsupported primary storage":
+                        return CommandResult(1, failure, log)
+                    raise CommandTimeout(failure)
 
-        # Advance the adapter clock at each command boundary. Slow fake-SDK
-        # interpreter startup must not consume the budget before this test's
-        # storage phase; real command reaping and startup cleanup are tested separately.
-        with mock.patch.object(android_adapter, "time", clock):
-            with mock.patch.object(android_adapter, "run_command", side_effect=observe):
-                with self.assertRaisesRegex(LeaseError, "did not boot within 1s"):
-                    self.backend._wait_ready(options, child, {}, log, Event(), transport, 1.0)
-        self.assertEqual(timeouts, [1.0, 0.75, 0.5])
+                # Advance at command boundaries so fake-SDK startup cannot
+                # consume the budget before the storage probe.
+                with mock.patch.object(android_adapter, "time", clock):
+                    with mock.patch.object(android_adapter, "run_command", side_effect=observe):
+                        with self.assertRaisesRegex(
+                            LeaseError, "booted, but readiness checks did not pass within 1s",
+                        ) as caught:
+                            self.backend._wait_ready(options, child, {}, log, Event(), transport, 1.0)
+                self.assertIn(f"; last ADB result: {failure};", str(caught.exception))
+                self.assertEqual(timeouts, [1.0, 0.75, 0.5])
 
     def test_storage_probe_cancellation_preserves_persistent_initialization_and_reuse(self):
         for mode in ("clean", "persistent-new", "persistent-reused"):

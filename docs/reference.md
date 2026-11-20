@@ -67,7 +67,9 @@ Neither mode monitors `Download` after the lease has been issued.
 These checks share the existing `boot_timeout` with transport and emulator
 startup. A failure or cancellation follows normal owned-child cleanup; it
 does not publish an endpoint or extend the boot deadline. Probe failures appear
-in the bounded ADB diagnostic log. An interrupted or failed probe can leave its
+in the bounded ADB diagnostic log. If Android reported that it had booted, a
+timeout reports that readiness checks did not pass, with the last ADB result
+when available. An interrupted or failed probe can leave its
 uniquely named temporary file in preserved persistent state; the adapter never
 deletes a pre-existing file to make readiness pass.
 

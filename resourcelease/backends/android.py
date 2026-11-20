@@ -694,6 +694,7 @@ class AndroidBackend:
     ) -> None:
         serial = f"emulator-{options.console_port}"
         last_error = ""
+        boot_completed = False
         probe_token = uuid.uuid4().hex
         while True:
             if cancelled.is_set():
@@ -714,8 +715,11 @@ class AndroidBackend:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 suffix = f"; last ADB result: {last_error}" if last_error else ""
+                timeout_message = (
+                    "booted, but readiness checks did not pass" if boot_completed else "did not boot"
+                )
                 raise LeaseError(
-                    f"Android emulator did not boot within {options.boot_timeout:g}s{suffix}; "
+                    f"Android emulator {timeout_message} within {options.boot_timeout:g}s{suffix}; "
                     f"bounded emulator/ADB logs: {child.log_path}, {adb_log}"
                 )
             command_timeout = min(COMMAND_TIMEOUT, remaining)
@@ -740,8 +744,8 @@ class AndroidBackend:
                         cancelled=cancelled,
                         append_log=True,
                     )
-                    if (boot.returncode == 0 and boot.output.strip() == "1"
-                            and time.monotonic() < deadline):
+                    if boot.returncode == 0 and boot.output.strip() == "1":
+                        boot_completed = True
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             continue

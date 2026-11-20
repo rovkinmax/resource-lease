@@ -52,9 +52,10 @@ SYSTEM_IMAGE = re.compile(
 )
 ANDROID_OPTIONS = frozenset({
     "sdk_root", "java_home", "system_image", "console_port", "memory_mb", "boot_timeout",
-    "state_mode", "state_directory",
+    "state_mode", "state_directory", "device_profile",
 })
 ANDROID_REQUIRED = frozenset({"sdk_root", "java_home", "system_image", "console_port"})
+DEVICE_PROFILE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,127}\Z")
 
 _READINESS_SCRIPT = r"""
 fail() { echo "$1" >&2; exit 1; }
@@ -63,22 +64,38 @@ require_download=$2
 token=$3
 package=$(pm path android) || fail "Package Manager not ready"
 case "$package" in package:*) ;; *) fail "Package Manager not ready";; esac
-primary=$(readlink -f "$storage") || fail "Primary storage unavailable"
+primary=$(readlink -f "$storage" 2>/dev/null) ||
+    primary=$(cd -P "$storage" 2>/dev/null && pwd -P) ||
+    fail "Primary storage unavailable"
 case "$primary" in /storage/emulated/*) ;; *) fail "Unsupported primary storage";; esac
 user=${primary#/storage/emulated/}
 case "$user" in ''|*[!0-9]*) fail "Unsupported primary storage user";; esac
 volumes=$(sm list-volumes emulated) || fail "StorageManager not ready"
-state=
-while read -r id candidate rest; do
-    case "$id" in
-        emulated|"emulated;$user")
-            [ -z "$state" ] || fail "Ambiguous primary storage"
-            state=$candidate;;
-    esac
-done <<VOLUMES
-$volumes
-VOLUMES
-[ "$state" = mounted ] || fail "Primary storage not mounted"
+[ "${#volumes}" -le 4096 ] || fail "StorageManager output exceeded its bound"
+# Older Android shells require a writable temporary directory for a here-document.
+check_volume() (
+    set -f
+    seen=0
+    state=
+    while [ -n "$volumes" ]; do
+        case "$volumes" in
+            *'
+'*) line=${volumes%%'
+'*}; volumes=${volumes#*'
+'};;
+            *) line=$volumes; volumes=;;
+        esac
+        set -- $line
+        case "${1-}" in
+            emulated|"emulated;$user")
+                [ "$seen" = 0 ] || fail "Ambiguous primary storage"
+                seen=1
+                state=${2-};;
+        esac
+    done
+    [ "$seen" = 1 ] && [ "$state" = mounted ] || fail "Primary storage not mounted"
+)
+check_volume || exit 1
 target=$storage
 if [ "$require_download" = 1 ]; then
     target="$storage/Download"
@@ -105,6 +122,7 @@ class _Options:
     boot_timeout: float
     state_mode: str
     state_directory: Path | None
+    device_profile: str | None
     image_identity: Mapping[str, object]
     avdmanager: Path
     emulator: Path
@@ -247,6 +265,12 @@ def _parse_options(slot: Slot) -> _Options:
     if unexpected:
         raise LeaseError(f"unsupported Android backend options: {', '.join(sorted(unexpected))}")
 
+    device_profile = options.get("device_profile")
+    if "device_profile" in options and (
+        not isinstance(device_profile, str) or not DEVICE_PROFILE.fullmatch(device_profile)
+    ):
+        raise LeaseError("Android device_profile must be a stable SDK device ID")
+
     state_mode = options.get("state_mode", "clean")
     if not isinstance(state_mode, str) or state_mode not in {"clean", "persistent"}:
         raise LeaseError("Android state_mode must be 'clean' or 'persistent'")
@@ -303,7 +327,7 @@ def _parse_options(slot: Slot) -> _Options:
     netsimd = _executable(sdk_root / "emulator" / "netsimd", "netsimd")
     return _Options(
         sdk_root, java_home, system_image, port, memory, timeout, state_mode,
-        state_directory, image_identity,
+        state_directory, device_profile, image_identity,
         avdmanager, emulator, adb, netsimd,
     )
 
@@ -473,7 +497,7 @@ class AndroidBackend:
         return AndroidMaintenance(
             options.state_directory, system_image=options.system_image,
             image_identity=options.image_identity, memory_mb=options.memory_mb,
-            placement=self.placement,
+            device_profile=options.device_profile, placement=self.placement,
         )
 
     def maintenance_key(self, slot: Slot) -> str:
@@ -509,6 +533,7 @@ class AndroidBackend:
                     system_image=options.system_image,
                     image_identity=options.image_identity,
                     memory_mb=options.memory_mb,
+                    device_profile=options.device_profile,
                     placement=self.placement,
                 )
             private_home = persistent_state.private_home
@@ -551,11 +576,14 @@ class AndroidBackend:
             if cancelled.is_set():
                 raise LeaseError("Android resource start cancelled before AVD creation")
             if create_avd:
+                avd_arguments = [
+                    options.avdmanager, "create", "avd", "-n", avd_name,
+                    "-k", options.system_image, "-p", avd_path,
+                ]
+                if options.device_profile is not None:
+                    avd_arguments.extend(("--device", options.device_profile))
                 created = run_command(
-                    [
-                        options.avdmanager, "create", "avd", "-n", avd_name,
-                        "-k", options.system_image, "-p", avd_path,
-                    ],
+                    avd_arguments,
                     env=environment,
                     timeout=60,
                     log_path=avdmanager_log,

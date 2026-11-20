@@ -885,6 +885,55 @@ class AndroidBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(LeaseError, "only valid"):
             self.backend.keys(Slot("android-test", ("test",), "android", options))
 
+    def test_explicit_device_profile_is_used_to_create_a_clean_avd(self):
+        options = {**self.slot().options, "device_profile": "tv_1080p"}
+        slot = Slot("android-tv", ("tv",), "android", options)
+        resource = self.backend.start(slot, self.generation(), Event())
+        self.addCleanup(resource.stop)
+        self.assertEqual(self.sdk.calls("avdmanager")[0]["args"][-2:], ["--device", "tv_1080p"])
+
+    def test_device_profile_rejects_invalid_ids_before_calling_the_sdk(self):
+        for invalid in (None, "", "--force", "Android TV", "../tv", 42):
+            with self.subTest(invalid=invalid):
+                options = {**self.slot().options, "device_profile": invalid}
+                with self.assertRaisesRegex(LeaseError, "stable SDK device ID"):
+                    self.backend.keys(Slot("android-tv", ("tv",), "android", options))
+        self.assertEqual(self.sdk.calls(), [])
+
+    def test_tv_device_profile_is_preserved_on_reuse_and_maintenance(self):
+        directory = self.root / "tv-state"
+        base = self.persistent_slot(directory)
+        slot = Slot(base.id, base.capabilities, base.backend, {
+            **base.options, "device_profile": "tv_1080p",
+        })
+        resource = self.backend.start(slot, self.generation(), Event())
+        self.addCleanup(resource.stop)
+        avd = self.sdk.calls("avdmanager")[0]["args"]
+        self.assertEqual(avd[-2:], ["--device", "tv_1080p"])
+        marker = Path(avd[avd.index("-p") + 1]) / "userdata-qemu.img"
+        marker.write_bytes(b"existing TV data")
+        resource.stop()
+
+        manifest = directory / ".resource-lease-android-state.json"
+        original_manifest = manifest.read_bytes()
+        self.assertEqual(json.loads(original_manifest)["profile"]["device_profile"], "tv_1080p")
+        with self.assertRaisesRegex(LeaseError, "state profile differs"):
+            self.backend.maintenance(base).inspect()
+        maintenance = self.backend.maintenance(slot)
+        before = maintenance.inspect()
+        custody = {"pool_id": "tv-pool", "lease_id": None}
+        archived = maintenance.archive("tv-archive", before["revision"], custody)
+        restored = maintenance.restore("tv-restore", archived["backup_id"], archived["revision"], custody)
+        self.assertEqual(restored["state"], "complete")
+
+        second = self.root / "second"
+        second.mkdir(mode=0o700)
+        replacement = self.backend.start(slot, second, Event())
+        self.addCleanup(replacement.stop)
+        self.assertEqual(len(self.sdk.calls("avdmanager")), 1)
+        self.assertEqual(marker.read_bytes(), b"existing TV data")
+        self.assertEqual(manifest.read_bytes(), original_manifest)
+
     def test_persistent_avd_is_reused_and_survives_release(self):
         state_directory = self.root / "persistent-state"
         first_generation = self.generation()

@@ -181,6 +181,40 @@ class AndroidMaintenanceTests(unittest.TestCase):
             2,
         )
 
+    def test_tv_legacy_manifest_is_registered_without_rewriting_guest_state(self):
+        for first_access in ("inspect", "check_start"):
+            with self.subTest(first_access=first_access):
+                self.new_case()
+                with mock.patch.object(AndroidPlacement, "reserve"):
+                    state = self.create_complete_state()
+                manifest_path = self.state_directory / ".resource-lease-android-state.json"
+                # The older TV writer stores the ID in the v1 profile, but
+                # creates neither placement claims nor a maintenance journal.
+                manifest = json.loads(manifest_path.read_text())
+                manifest["profile"]["device_profile"] = "tv_1080p"
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                original = manifest_path.read_bytes()
+                marker = state.avd_path / "user-data"
+                marker.write_bytes(b"preserved TV state")
+
+                with self.assertRaisesRegex(LeaseError, "state profile differs"):
+                    self.maintenance.inspect()
+                self.assertFalse(self.maintenance._maintenance_directory.exists())
+                self.assertFalse(list(self.root.glob(f"{maintenance_module.PLACEMENT_CLAIM_PREFIX}*")))
+
+                tv = AndroidMaintenance(
+                    self.state_directory,
+                    system_image=SYSTEM_IMAGE,
+                    image_identity=PROFILE["image_identity"],
+                    memory_mb=PROFILE["memory_mb"],
+                    device_profile="tv_1080p",
+                    placement=self.placement,
+                )
+                getattr(tv, first_access)()
+                self.assertEqual(tv.inspect()["state"], "complete")
+                self.assertEqual(manifest_path.read_bytes(), original)
+                self.assertEqual(marker.read_bytes(), b"preserved TV state")
+
     def test_absent_legacy_lineage_without_claim_fails_closed(self):
         self.maintenance._maintenance_directory.mkdir(mode=0o700)
         sentinel = self.maintenance._maintenance_directory / "operator-data"

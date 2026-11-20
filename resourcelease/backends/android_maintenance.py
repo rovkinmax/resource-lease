@@ -26,6 +26,7 @@ from resourcelease.backends.android_state import (
     _sync_directory,
     _write_all,
     canonical_state_directory,
+    persistent_android_profile,
     state_identity,
 )
 from resourcelease.backends.android_placement import (
@@ -171,6 +172,7 @@ class AndroidMaintenance:
         system_image: str,
         image_identity: Mapping[str, object],
         memory_mb: int,
+        device_profile: str | None = None,
         placement: AndroidPlacement | None = None,
     ) -> None:
         self.directory = canonical_state_directory(os.fspath(directory))
@@ -183,11 +185,7 @@ class AndroidMaintenance:
             raise LeaseError("Android maintenance memory_mb is invalid")
         if not isinstance(image_identity, Mapping):
             raise LeaseError("Android maintenance image_identity is invalid")
-        self.profile: dict[str, object] = {
-            "system_image": system_image,
-            "image_identity": dict(image_identity),
-            "memory_mb": memory_mb,
-        }
+        self.profile = persistent_android_profile(system_image, image_identity, memory_mb, device_profile)
         try:
             encoded_profile = json.dumps(
                 self.profile, sort_keys=True, separators=(",", ":"), allow_nan=False,

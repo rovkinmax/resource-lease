@@ -9,7 +9,7 @@ AVD; an explicitly configured persistent mode reuses a private managed AVD.
 
 Set how many emulators may run at once; jobs wait their turn.
 The tool runs locally and has no third-party Python runtime dependencies.
-It does not run your tests or build commands.
+You bring the command to run on the leased device.
 
 ## What you need
 
@@ -42,7 +42,37 @@ source .venv/bin/activate
 Prefer a single file? [Build a zipapp](docs/testing.md#build-and-check-the-packages)
 and use `python3 resource-lease.pyz` in place of `resource-lease`.
 
-## Start a pool
+## Run a clean emulator
+
+Set up the local account once with your installed SDK and JDK:
+
+```sh
+resource-lease android configure --sdk "$ANDROID_HOME" --java-home "$JAVA_HOME"
+```
+
+Pick an exact package from the list, then run a foreground command:
+
+```sh
+resource-lease android list
+resource-lease android run \
+  --image 'system-images;android-36.1;google_apis_playstore;arm64-v8a' \
+  -- adb shell getprop ro.build.version.sdk
+```
+
+The fourth request waits when three runs are using this local launcher.
+Press Ctrl+C to cancel. Every launch has a new AVD and an owned ADB server;
+the command gets the exact device through `ANDROID_SERIAL` and
+`ADB_SERVER_SOCKET`. When the command finishes, the lease stops and cleans
+up its emulator. Use an SDK hardware profile with `--device` if your image
+requires it. Do not detach work or run SDK commands outside the lease to
+work around the queue.
+
+The limit applies to requests through `resource-lease android run`, not to
+manual Android Studio devices or the older `--root` pool interface. Do not
+delete host admission state to recover from uncertain cleanup. See the
+[clean launch reference](docs/reference.md#clean-android-launch).
+
+## Existing pool interface
 
 Copy [examples/android.json](examples/android.json) to a file outside this
 checkout. Set `sdk_root` and `java_home` to absolute paths, and choose an installed

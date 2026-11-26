@@ -231,6 +231,7 @@ def launch_child(
     env: Mapping[str, str],
     log_path: Path,
     log_limit: int = MAX_LOG_BYTES,
+    pass_fds: tuple[int, ...] = (),
 ) -> ManagedProcess:
     """Launch one owned child with bounded diagnostics and no shell expansion."""
     if (isinstance(argv, (str, bytes)) or not argv
@@ -247,6 +248,7 @@ def launch_child(
             stderr=subprocess.STDOUT,
             env=dict(env),
             close_fds=True,
+            pass_fds=pass_fds,
             bufsize=0,
         )
         collector = _OutputCollector(

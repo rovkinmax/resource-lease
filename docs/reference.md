@@ -1,12 +1,37 @@
 # Standalone resource lease CLI
 
-This tool manages a local resource pool without a CI server, task tracker,
-build runner, or package registry. The core is platform-neutral; the
-included Android adapter manages disposable emulators by default and supports
-an explicitly configured persistent AVD.
+This tool manages local Android leases without a CI server, task tracker,
+or package registry. The Android command runs a fresh AVD without a pool.
+The existing `--root` interface still supports configured pools.
 Python 3.11+ and POSIX file locking are required. It does not install itself.
 
-## Quick start
+## Clean Android launch
+
+`android configure --sdk PATH --java-home PATH` initializes a private
+authority under the operating-system account's home. It will not overwrite
+existing state. `android list` prints exact installed package IDs from that
+SDK. This inventory does not claim each image has booted or is suitable
+for a particular project. `android run --image PACKAGE [--device SDK_ID]
+-- COMMAND [ARG ...]` retains the exact package binding while waiting.
+An absent, replaced or invalid selected package fails without downloading
+an SDK component or falling back to a different package.
+
+Each client owns its direct children; it enqueues once, renews the waiting
+request while alive, and admits the oldest waiting request only within the
+shared three-run budget. Waiting past a cancellation never starts an AVD.
+Boot, command execution and teardown count until cleanup is confirmed.
+An abrupt loss of ownership keeps a reservation counted; stopping another
+emulator or clearing the database is not evidence of cleanup. Missing
+admission state is an error, not another budget to initialize automatically.
+Caller environment and current directory do not select a second authority.
+
+The command receives `ANDROID_SERIAL` and `ADB_SERVER_SOCKET` for the
+lease's owned local ADB. It must finish all its device work before returning.
+The runner is not a sandbox and does not support detached commands. It
+uses live SDK child handles rather than issuing `adb emu kill`; it does not
+own the machine's default ADB server or manually launched devices.
+
+## Pool quick start
 
 Copy `examples/android.json` to a private configuration file.
 Set absolute paths to your installed SDK and Java home, an already installed

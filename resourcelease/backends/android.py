@@ -18,6 +18,7 @@ from typing import Mapping
 import uuid
 
 from resourcelease.model import LeaseError, QuarantineError, Resource, Slot
+from resourcelease.backends.android_adb import OwnedAdb
 from resourcelease.backends.android_state import (
     PersistentAndroidState,
     canonical_state_directory,
@@ -48,7 +49,8 @@ COMMAND_TIMEOUT = 5.0
 PORT_RELEASE_TIMEOUT = 5.0
 PORT_POLL_INTERVAL = 0.1
 SYSTEM_IMAGE = re.compile(
-    r"system-images;android-[1-9][0-9]*;[A-Za-z0-9_.+-]+;[A-Za-z0-9_.+-]+\Z"
+    r"system-images;android-[1-9][0-9]*(?:\.[0-9]+|-ext[1-9][0-9]*)?"
+    r";[A-Za-z0-9_.+-]+;[A-Za-z0-9_.+-]+\Z"
 )
 ANDROID_OPTIONS = frozenset({
     "sdk_root", "java_home", "system_image", "console_port", "memory_mb", "boot_timeout",
@@ -514,7 +516,9 @@ class AndroidBackend:
             keys.append(f"android-state:{state_identity(options.state_directory)}")
         return tuple(keys)
 
-    def start(self, slot: Slot, directory: Path, cancelled: Event) -> "AndroidResource":
+    def start(
+        self, slot: Slot, directory: Path, cancelled: Event, *, owned_adb: OwnedAdb | None = None,
+    ) -> "AndroidResource":
         options = _parse_options(slot)
         generation = _require_generation(directory)
         _assert_ports_free(options)
@@ -566,6 +570,8 @@ class AndroidBackend:
         netsimd: ManagedProcess | None = None
 
         try:
+            if owned_adb is not None:
+                environment = owned_adb.emulator_environment(environment, private_home)
             temporary = runtime_home / "netsim-tmp"
             temporary.mkdir(mode=0o700)
             child_environment = {
@@ -621,7 +627,11 @@ class AndroidBackend:
                 [
                     options.emulator,
                     "-avd", avd_name,
-                    "-ports", f"{options.console_port},{options.adb_port}",
+                    *(
+                        ("-port", str(options.console_port)) if owned_adb is not None
+                        else ("-ports", f"{options.console_port},{options.adb_port}")
+                    ),
+                    *(("-adb-path", options.adb) if owned_adb is not None else ()),
                     "-memory", str(options.memory_mb),
                     "-no-window",
                     "-no-snapshot",

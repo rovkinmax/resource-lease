@@ -88,7 +88,15 @@ if tool in ("emulator", "netsimd"):
         print(f"fixture {tool} startup failure", file=sys.stderr)
         raise SystemExit(17)
     if tool == "emulator":
-        console_port, adb_port = (int(value) for value in args[args.index("-ports") + 1].split(","))
+        if "-port" in args:
+            console_port = int(args[args.index("-port") + 1])
+            adb_port = console_port + 1
+            home_key = Path(os.environ["HOME"]) / ".android" / "adbkey.pub"
+            emulator_key = Path(os.environ["ANDROID_EMULATOR_HOME"]) / "adbkey.pub"
+            if not home_key.is_file() or home_key.read_bytes() != emulator_key.read_bytes():
+                raise SystemExit("fixture ADB authentication keys differ")
+        else:
+            console_port, adb_port = (int(value) for value in args[args.index("-ports") + 1].split(","))
         ports = (console_port, adb_port)
     else:
         console_port = int(args[args.index("--grpc-port") + 1])
@@ -106,6 +114,10 @@ if tool in ("emulator", "netsimd"):
             listener.listen(1)
             listeners.append(listener)
         marker.write_text(str(os.getpid()), encoding="ascii")
+        if tool == "emulator" and "-port" in args:
+            (Path(os.environ["ANDROID_USER_HOME"]).parent / "adb-home" / "serial").write_text(
+                f"emulator-{console_port}", encoding="ascii",
+            )
         (root / f"{tool}-started").write_text(str(os.getpid()), encoding="ascii")
         active = True
 
@@ -148,6 +160,29 @@ if tool in ("emulator", "netsimd"):
     raise SystemExit(0)
 
 if tool == "adb":
+    if args[:1] == ["keygen"]:
+        key = Path(args[1])
+        key.write_bytes(b"fake private key")
+        key.with_suffix(".pub").write_bytes(b"fake public key " + str(key).encode())
+        raise SystemExit(0)
+    if args[:1] == ["-L"]:
+        fd = int(args[1].removeprefix("acceptfd:"))
+        listener = socket.socket(fileno=fd)
+        while True:
+            connection, _ = listener.accept()
+            with connection, connection.makefile("rb") as stream:
+                query = stream.read(int(stream.read(4), 16))
+                serial_file = Path(os.environ["HOME"]) / "serial"
+                if query == b"host:version":
+                    answer = b"0029"
+                elif query == b"host:devices":
+                    answer = (
+                        (serial_file.read_text() + "\tdevice\n").encode()
+                        if serial_file.exists() else b""
+                    )
+                else:
+                    raise SystemExit(64)
+                connection.sendall(b"OKAY" + f"{len(answer):04x}".encode() + answer)
     if len(args) < 3 or args[0] != "-s":
         print("adb must target one exact serial", file=sys.stderr)
         raise SystemExit(64)
@@ -892,6 +927,39 @@ class AndroidBackendTests(unittest.TestCase):
         self.addCleanup(resource.stop)
         self.assertEqual(self.sdk.calls("avdmanager")[0]["args"][-2:], ["--device", "tv_1080p"])
 
+    def test_exact_extension_and_minor_packages_are_passed_unchanged(self):
+        for index, platform in enumerate(("android-33-ext5", "android-36.1")):
+            with self.subTest(platform=platform):
+                parts = ("system-images", platform, "google_apis_playstore", "arm64-v8a")
+                package_id = ";".join(parts)
+                image = self.sdk.sdk_root.joinpath(*parts)
+                image.mkdir(parents=True)
+                (image / "system.img").write_bytes(b"exact fake system image")
+                slot = Slot("android-test", ("test",), "android", {
+                    **self.slot().options, "system_image": package_id,
+                })
+                generation = self.root / f"generation-{index}"
+                generation.mkdir(mode=0o700)
+                resource = self.backend.start(slot, generation, Event())
+                self.addCleanup(resource.stop)
+                args = self.sdk.calls("avdmanager")[index]["args"]
+                self.assertEqual(args[args.index("-k") + 1], package_id)
+                resource.stop()
+
+    def test_missing_exact_package_does_not_use_an_installed_neighbor(self):
+        for platform, neighbor in (("android-33-ext5", "android-33"), ("android-36.1", "android-36")):
+            parts = ("system-images", neighbor, "google_apis_playstore", "arm64-v8a")
+            image = self.sdk.sdk_root.joinpath(*parts)
+            image.mkdir(parents=True)
+            (image / "system.img").write_bytes(b"fake neighboring image")
+            with self.subTest(platform=platform), self.assertRaisesRegex(
+                LeaseError, f"cannot identify installed Android system image: .*{platform}",
+            ):
+                self.backend.keys(Slot("android-test", ("test",), "android", {
+                    **self.slot().options, "system_image": ";".join((parts[0], platform, *parts[2:])),
+                }))
+        self.assertEqual(self.sdk.calls(), [])
+
     def test_device_profile_rejects_invalid_ids_before_calling_the_sdk(self):
         for invalid in (None, "", "--force", "Android TV", "../tv", 42):
             with self.subTest(invalid=invalid):
@@ -1221,6 +1289,9 @@ class AndroidBackendTests(unittest.TestCase):
             {"memory_mb": True},
             {"boot_timeout": float("nan")},
             {"system_image": "system-images;../../bad"},
+            {"system_image": SYSTEM_IMAGE.replace("android-34", "android-33-ext")},
+            {"system_image": SYSTEM_IMAGE.replace("android-34", "android-36.")},
+            {"system_image": SYSTEM_IMAGE.replace("android-34", "android-36.1/../")},
             {"unapproved_option": "value"},
         ]
         for override in cases:
